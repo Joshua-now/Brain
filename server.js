@@ -254,14 +254,37 @@ app.delete("/memories/:id", async (req, res) => {
 });
 
 // ── REFLECTOR core ───────────────────────────────────────────────────────────
-const REFLECT_SYS = `You are the reflection engine for an AI agent's long-term memory. You are given recent raw interactions for ONE scope, each optionally tagged with an outcome signal. Extract only DURABLE, reusable memory worth recalling next time.
-Rules:
-- Capture: facts, reusable playbooks/how-tos, the owner's preferences, and mistakes to avoid.
+const REFLECT_SYS = `You are the reflection engine for a contractor's long-term business memory. The raw interactions you are given are almost always an END CUSTOMER talking to this contractor's AI assistant - NOT the contractor themselves. Whatever you extract here becomes permanent memory shown to the assistant in EVERY future conversation, with EVERY different customer, for this contractor. That is the one rule everything else follows from.
+
+ABSOLUTE, NON-NEGOTIABLE: never output anything that identifies or describes ONE specific individual customer - no name, phone number, email, address, or "this customer wants/said/prefers X" tied to a person. A detail true of the one person in this transcript is exactly the kind of thing that must NOT leak into some other customer's conversation next week. If you are tempted to write "the customer's name is X" or "phone number is X" or "prefers text messages" - do not. That is customer data, not business memory, and it does not belong here no matter how the item is typed.
+
+What DOES belong here - durable facts about the BUSINESS itself, true for any customer:
+- fact: something true about the business - what it offers, its policies, service area, hours, how pricing generally works. Never a fact about who called or what they personally said.
+- playbook: a reusable, generic how-to for handling a CATEGORY of request (e.g. "when someone asks for a quote on X, do Y") - phrased so it applies to the next customer too, never naming the customer from this transcript.
+- preference: an aggregate pattern about customers IN GENERAL for this business (e.g. "customers often ask about financing" is fine because it is about the customer base, not one person) - never one identified customer's personal preference.
+- mistake: a generic lesson about how the ASSISTANT should behave differently next time - never framed around one customer's identity.
+
+Other rules:
 - Weight lessons by outcome: things that led to success or a correction matter most.
-- Be SPECIFIC and tie each to a TRIGGER (when it applies). No vague advice like "be better".
+- Be SPECIFIC about the business/behavior pattern, and tie each to a TRIGGER (when it applies). No vague advice like "be better", and no specifics about the individual in this transcript.
 - Skip one-off trivia and anything obvious.
-- Output ONLY a JSON array. Each item: {"type":"fact|playbook|preference|mistake","content":"specific lesson","trigger":"when it applies"}
-- If nothing is worth saving, output [].`;
+- Output ONLY a JSON array. Each item: {"type":"fact|playbook|preference|mistake","content":"specific lesson - about the business or a category of request, never about one identified customer","trigger":"when it applies"}
+- If nothing durable and non-identifying is worth saving, output [].`;
+
+// Hard, code-level backstop for the rule above - prompt compliance alone
+// isn't reliable enough (this exact leak happened live even with a much
+// milder version of this prompt). Reject - never insert - any reflected item
+// whose content or trigger looks like it identifies one individual: a phone
+// number, an email address, or a "so-and-so's name/phone/prefers" phrase.
+// Rejecting the whole item is deliberate - a redacted half-fact is still
+// confusing and still hints at data that shouldn't be there.
+const REFLECT_PHONE_RE = /(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/;
+const REFLECT_EMAIL_RE = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+const REFLECT_NAME_PHRASE_RE = /\b(customer'?s?|user'?s?|caller'?s?|client'?s?)\s+(full\s+)?name\s+is\b|\bmy name is\b/i;
+function looksLikeIdentifyingInfo(str) {
+  const s = normText(String(str || ""));
+  return REFLECT_PHONE_RE.test(s) || REFLECT_EMAIL_RE.test(s) || REFLECT_NAME_PHRASE_RE.test(s);
+}
 
 async function llmReflect(text) {
   const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -294,11 +317,19 @@ async function reflectScope(scope, limit = 60) {
   if (!traj.length) return { added: 0, reinforced: 0, reflected_rows: 0, note: "nothing new" };
   const text = traj.map(t => `${t.role}${t.signal ? ` [${t.signal}]` : ""}: ${t.content}`).join("\n").slice(-14000);
   const items = await llmReflect(text);
-  let added = 0, reinforced = 0;
+  let added = 0, reinforced = 0, rejected = 0;
   for (const it of (Array.isArray(items) ? items : [])) {
     const content = normText(String(it?.content || "").trim()); if (!content) continue;
     const type = ["fact", "playbook", "preference", "mistake"].includes(it?.type) ? it.type : "fact";
     const trigger = normText(String(it?.trigger || "").slice(0, 300));
+    // Hard backstop: never let one customer's identifying info become
+    // permanent memory every other future customer's conversation will see.
+    // See REFLECT_SYS above for the full reasoning - this is the code-level
+    // enforcement of that rule, not just a prompt ask.
+    if (looksLikeIdentifyingInfo(content) || looksLikeIdentifyingInfo(trigger)) {
+      console.warn(`[reflect] rejected identifying-info item for scope=${scope}: ${content.slice(0, 120)}`);
+      rejected++; continue;
+    }
     const dup = await pool.query("SELECT id FROM memories WHERE scope=$1 AND content=$2 LIMIT 1", [scope, content.slice(0, 2000)]);
     if (dup.rowCount) {
       // early CURATOR: reinforce instead of duplicate.
@@ -309,7 +340,7 @@ async function reflectScope(scope, limit = 60) {
     added++;
   }
   await pool.query("UPDATE trajectories SET reflected=true WHERE id = ANY($1)", [traj.map(t => t.id)]);
-  return { added, reinforced, reflected_rows: traj.length, items };
+  return { added, reinforced, rejected, reflected_rows: traj.length, items };
 }
 
 app.post("/reflect", async (req, res) => {
