@@ -276,7 +276,8 @@ Only call a tool when you actually need it. If you do not need a tool, just answ
 // unless it is verbatim in the contractor's own standing memory.
 const PHONE_RE = /(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g;
 function stripUnverifiedPhoneNumbers(text, standingBlock) {
-  return String(text).replace(PHONE_RE, (m) => (standingBlock && standingBlock.includes(m)) ? m : "[no verified callback number on file]");
+  const norm = normText(String(text)); // catches smart hyphens (e.g. "555\u2011...") the raw regex would miss
+  return norm.replace(PHONE_RE, (m) => (standingBlock && normText(standingBlock).includes(m)) ? m : "[no verified callback number on file]");
 }
 
 function parseAction(raw) {
