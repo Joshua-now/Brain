@@ -270,38 +270,82 @@ async function autoReflectTick() {
 // The model underneath is a one-variable swap (RESPOND_MODEL) via OpenRouter.
 // Nothing calls this yet on purpose - it is proven standalone first.
 //
-// TOOLS below are MOSTLY STUBS during this build-out. get_business_info and
-// check_service_capability are real (they read this service's own memory
-// table). Everything else honestly reports {stub:true} rather than pretending
-// to be wired to a real CRM/calendar/SMS provider that does not exist yet.
-const TOOLS = {
-  async get_business_info({ scope }) {
-    const { rows } = await pool.query(
-      "SELECT type, content, trigger FROM memories WHERE scope=$1 ORDER BY confidence DESC, updated_at DESC LIMIT 120", [scope]);
-    return { count: rows.length, memories: rows };
+// TOOL LIBRARY - progressive disclosure, same idea as how Claude Code's own
+// tools work (most are "deferred" until searched for by name). Only tools
+// flagged `always: true` are described to the model on the first turn. Any
+// other tool must be discovered first via find_tools({query}) before the
+// model can call it - the full list is never dumped into every prompt.
+// get_business_info, check_service_capability and get_pricing are REAL (they
+// read this service's own memory table). Everything else honestly reports
+// {stub:true} rather than pretending to be wired to a real CRM/calendar/SMS
+// provider that does not exist yet.
+const TOOL_LIBRARY = {
+  find_tools: {
+    always: true,
+    description: "Search for tools relevant to what you need right now. Pass {\"query\": \"plain words\"} describing the task (e.g. \"book an appointment\", \"what we charge\"). Returns matching tool names + descriptions you can then call directly.",
+    keywords: [],
+    async run({ query }) {
+      const q = normText(String(query || "").toLowerCase());
+      const all = Object.entries(TOOL_LIBRARY).filter(([, t]) => !t.always);
+      let hits = all.filter(([name, t]) => !q || name.toLowerCase().includes(q) || (t.keywords || []).some(k => q.includes(k) || k.includes(q)));
+      if (!hits.length) hits = all; // library is small right now - don't dead-end the model on a miss
+      return { matches: hits.map(([name, t]) => ({ tool: name, description: t.description })) };
+    },
   },
-  async check_service_capability({ scope, query: q }) {
-    const term = normText(String(q || "").trim());
-    if (!term) return { matched: false, items: [], note: "no search term given - this means UNKNOWN, not \"no\"" };
-    const { rows } = await pool.query(
-      "SELECT type, content, trigger FROM memories WHERE scope=$1 AND (content ILIKE $2 OR trigger ILIKE $2) ORDER BY confidence DESC LIMIT 5",
-      [scope, `%${term.slice(0, 100)}%`]);
-    return {
-      matched: rows.length > 0, items: rows,
-      note: rows.length > 0 ? undefined : "no memory found for this - this means UNKNOWN whether we do this, NOT a \"no\". Do not tell the customer we don't offer it.",
-    };
+  handoff_to_human: {
+    always: true,
+    description: "Use when you cannot help with something yourself - the universal fallback. No args needed.",
+    keywords: ["human", "help", "escalate", "manager", "someone else"],
+    async run() { return { stub: true, note: "not wired to a real handoff mechanism yet - tell the customer someone from the team will follow up" }; },
   },
-  async check_service_area() { return { stub: true, note: "not wired to real service-area data yet" }; },
-  async get_pricing() { return { stub: true, note: "not wired to real pricing data yet" }; },
-  async check_calendar() { return { stub: true, note: "not wired to a real calendar yet" }; },
-  async book_appointment() { return { stub: true, note: "not wired to a real calendar yet" }; },
-  async create_lead() { return { stub: true, note: "not wired to a real CRM yet" }; },
-  async update_lead() { return { stub: true, note: "not wired to a real CRM yet" }; },
-  async notify_owner() { return { stub: true, note: "not wired to a real notification channel yet" }; },
-  async send_sms() { return { stub: true, note: "not wired to a real SMS provider yet" }; },
-  async handoff_to_human() { return { stub: true, note: "not wired to a real handoff mechanism yet" }; },
+  get_business_info: {
+    description: "Pull everything remembered about this business - facts, playbooks, preferences. Rarely needed since the standing memory in your system prompt already has the top items.",
+    keywords: ["business", "info", "memory", "know", "remember"],
+    async run({ scope }) {
+      const { rows } = await pool.query(
+        "SELECT type, content, trigger FROM memories WHERE scope=$1 ORDER BY confidence DESC, updated_at DESC LIMIT 120", [scope]);
+      return { count: rows.length, memories: rows };
+    },
+  },
+  check_service_capability: {
+    description: "Check whether this business services a specific thing (a brand, a system type, a job type). Pass {\"query\": \"mini split\"}.",
+    keywords: ["service", "offer", "do you", "capability", "repair", "install", "brand"],
+    async run({ scope, query: q }) {
+      const term = normText(String(q || "").trim());
+      if (!term) return { matched: false, items: [], note: "no search term given - this means UNKNOWN, not \"no\"" };
+      const { rows } = await pool.query(
+        "SELECT type, content, trigger FROM memories WHERE scope=$1 AND (content ILIKE $2 OR trigger ILIKE $2) ORDER BY confidence DESC LIMIT 5",
+        [scope, `%${term.slice(0, 100)}%`]);
+      return {
+        matched: rows.length > 0, items: rows,
+        note: rows.length > 0 ? undefined : "no memory found for this - this means UNKNOWN whether we do this, NOT a \"no\". Do not tell the customer we don't offer it.",
+      };
+    },
+  },
+  get_pricing: {
+    description: "Look up THIS BUSINESS's own pricing/fees from memory (service call fee, diagnostic fee, etc) - NOT Joshua's own SaaS pricing. Pass {\"query\": \"diagnostic fee\"} or leave blank for general pricing facts.",
+    keywords: ["price", "pricing", "cost", "fee", "charge", "how much", "rate", "quote"],
+    async run({ scope, query: q }) {
+      const term = normText(String(q || "").trim());
+      const params = [scope];
+      let sql = "SELECT type, content, trigger FROM memories WHERE scope=$1 AND (content ILIKE '%price%' OR content ILIKE '%cost%' OR content ILIKE '%fee%' OR content ILIKE '%$%' OR trigger ILIKE '%price%' OR trigger ILIKE '%cost%')";
+      if (term) { sql += " AND (content ILIKE $2 OR trigger ILIKE $2)"; params.push(`%${term.slice(0, 100)}%`); }
+      sql += " ORDER BY confidence DESC LIMIT 8";
+      const { rows } = await pool.query(sql, params);
+      return {
+        matched: rows.length > 0, items: rows,
+        note: rows.length > 0 ? undefined : "no pricing information on file for this business - this means UNKNOWN, not a specific number. Do not invent a price.",
+      };
+    },
+  },
+  check_service_area: { description: "Check whether a location/zip is inside this business's service area.", keywords: ["area", "zip", "location", "travel", "far"], async run() { return { stub: true, note: "not wired to real service-area data yet" }; } },
+  check_calendar: { description: "Check real-time appointment availability.", keywords: ["calendar", "availability", "schedule", "appointment", "when", "book"], async run() { return { stub: true, note: "not wired to a real calendar yet" }; } },
+  book_appointment: { description: "Book a real appointment on the calendar.", keywords: ["book", "schedule", "appointment", "reserve"], async run() { return { stub: true, note: "not wired to a real calendar yet" }; } },
+  create_lead: { description: "Create a new lead/contact in the CRM.", keywords: ["lead", "new customer", "contact", "crm"], async run() { return { stub: true, note: "not wired to a real CRM yet" }; } },
+  update_lead: { description: "Update an existing lead/contact in the CRM.", keywords: ["update", "lead", "contact", "crm", "note"], async run() { return { stub: true, note: "not wired to a real CRM yet" }; } },
+  notify_owner: { description: "Notify the business owner directly about something urgent.", keywords: ["notify", "alert", "owner", "urgent", "tell them"], async run() { return { stub: true, note: "not wired to a real notification channel yet" }; } },
+  send_sms: { description: "Send a text message to the customer.", keywords: ["text", "sms", "message", "send"], async run() { return { stub: true, note: "not wired to a real SMS provider yet" }; } },
 };
-const TOOL_LIST = Object.keys(TOOLS);
 const RESPOND_MODEL = process.env.RESPOND_MODEL || REFLECT_MODEL;
 
 // $ per token (not per million - keeps callCost() simple). Source: OpenRouter's
@@ -324,12 +368,19 @@ const MODULE_PRICE_USD = {
   field_app: 180,
 };
 
-const RESPOND_SYS = (standingBlock) => `You are the Contractor Brain for one specific contractor. Answer the incoming message directly and briefly, the way a sharp office manager would.
+function toolBlock(names) {
+  return names.map(n => `- ${n}: ${TOOL_LIBRARY[n].description}`).join("\n");
+}
+
+const RESPOND_SYS = (standingBlock, toolNames) => `You are the Contractor Brain for one specific contractor. Answer the incoming message directly and briefly, the way a sharp office manager would.
 You have this business's known memory below - treat it as ground truth, do not contradict it:
 ${standingBlock || "(no memory recorded yet for this contractor)"}
 
-You have tools you may call when you need information you do not already have. Available tools: ${TOOL_LIST.join(", ")}.
-Most of these tools are STUBS during this build-out and will say so in their result - if a tool result has "stub": true, tell the truth: say you do not have that wired up yet rather than making something up.
+TOOLS AVAILABLE RIGHT NOW:
+${toolBlock(toolNames)}
+
+This is not the full list of everything this brain can eventually do - it is only what is loaded for you this turn. If none of these fit what you need, call find_tools with a plain-language description of the task (e.g. "book an appointment", "what do we charge") and more tools will unlock for your next move.
+Most non-core tools are STUBS during this build-out and will say so in their result - if a tool result has "stub": true, tell the truth: say you do not have that wired up yet rather than making something up.
 
 HARD RULE: you have NO phone number, address, price, or contact detail of any kind unless it appears verbatim in the memory block above or in a tool result. Do not output any phone number, address, or price under any circumstances unless it is copied verbatim from memory or a tool result. If a customer asks to book or asks for contact info and you cannot do it yourself (a tool result says stub:true, or you have no tool for it), say exactly this kind of thing: "I cannot book that myself yet - someone from the team will follow up with you directly." Never invent a callback number or address to fill that gap. A tool result with no match (matched: false, or an empty items list) means you do not know the answer - it is NOT evidence the business doesn't offer something. Never turn "no memory found" into "we don't do that" - say you're not sure and someone will confirm.
 To call a tool, end your reply with a line of the exact form:
@@ -408,36 +459,64 @@ app.post("/v1/brain/respond", async (req, res) => {
     for (const t of order) if (byType[t]?.length) {
       standingBlock += `\n${label[t]}:\n` + byType[t].map(r => `- ${r.content}${r.trigger ? ` (when: ${r.trigger})` : ""}`).join("\n") + "\n";
     }
+    standingBlock = standingBlock.trim();
 
+    // Progressive tool disclosure: start with only the "always" tools loaded.
+    // find_tools unlocks more, mid-conversation, as the model asks for them -
+    // never the full library dumped into the prompt up front.
+    const unlocked = new Set(Object.keys(TOOL_LIBRARY).filter(n => TOOL_LIBRARY[n].always));
     const messages = [
-      { role: "system", content: RESPOND_SYS(standingBlock.trim()) },
+      { role: "system", content: RESPOND_SYS(standingBlock, [...unlocked]) },
       { role: "user", content: String(message).slice(0, 4000) },
     ];
 
-    let call = await callModel(messages);
-    let raw = call.content;
-    let totalTokensIn = call.tokensIn || 0, totalTokensOut = call.tokensOut || 0;
-    let { text, action } = parseAction(raw);
-    text = stripUnverifiedPhoneNumbers(text, standingBlock);
-    let toolResult = null;
+    let totalTokensIn = 0, totalTokensOut = 0;
+    let finalText = "", lastAction = null, lastToolResult = null;
+    const MAX_STEPS = 4; // find_tools -> real tool -> final answer, plus one spare
 
-    if (action && TOOLS[action.tool]) {
-      toolResult = await TOOLS[action.tool]({ scope, ...(action.args || {}) });
-      messages.push({ role: "assistant", content: raw });
-      messages.push({ role: "user", content: `TOOL RESULT for ${action.tool}: ${JSON.stringify(toolResult)}\n\nNow give the final answer, plain text, no ACTION line.` });
-      call = await callModel(messages);
-      raw = call.content;
+    for (let step = 0; step < MAX_STEPS; step++) {
+      const call = await callModel(messages);
       totalTokensIn += call.tokensIn || 0; totalTokensOut += call.tokensOut || 0;
-      text = stripUnverifiedPhoneNumbers(raw.trim(), standingBlock);
-    } else if (action) {
-      toolResult = { error: `unknown tool "${action.tool}"` };
+      const { text, action } = parseAction(call.content);
+
+      if (!action) { finalText = text; break; }
+
+      messages.push({ role: "assistant", content: call.content });
+
+      if (action.tool === "find_tools") {
+        const result = await TOOL_LIBRARY.find_tools.run({ scope, ...(action.args || {}) });
+        (result.matches || []).forEach(m => unlocked.add(m.tool));
+        lastAction = action.tool; lastToolResult = result;
+        messages[0] = { role: "system", content: RESPOND_SYS(standingBlock, [...unlocked]) };
+        messages.push({ role: "user", content: `TOOL RESULT for find_tools: ${JSON.stringify(result)}\n\nThose tools are now available if you need them. Continue - either call one of them, or give your final answer to the customer.` });
+        continue;
+      }
+
+      if (unlocked.has(action.tool) && TOOL_LIBRARY[action.tool]) {
+        const result = await TOOL_LIBRARY[action.tool].run({ scope, ...(action.args || {}) });
+        lastAction = action.tool; lastToolResult = result;
+        messages.push({ role: "user", content: `TOOL RESULT for ${action.tool}: ${JSON.stringify(result)}\n\nNow give the final answer, plain text, no ACTION line unless you genuinely need one more tool.` });
+        continue;
+      }
+
+      lastAction = action.tool;
+      lastToolResult = { error: `"${action.tool}" is not loaded yet - call find_tools first to discover it, or it may not exist.` };
+      messages.push({ role: "user", content: `TOOL RESULT: ${JSON.stringify(lastToolResult)}` });
     }
 
+    if (!finalText) {
+      messages.push({ role: "user", content: "Give your final answer now, plain text only, no ACTION line." });
+      const call = await callModel(messages);
+      totalTokensIn += call.tokensIn || 0; totalTokensOut += call.tokensOut || 0;
+      finalText = parseAction(call.content).text;
+    }
+    finalText = stripUnverifiedPhoneNumbers(finalText, standingBlock);
+
     await pool.query("INSERT INTO trajectories(scope, session_id, role, content) VALUES ($1,$2,'assistant',$3)",
-      [scope, String(conversation_id).slice(0, 200), text.slice(0, 20000)]);
+      [scope, String(conversation_id).slice(0, 200), finalText.slice(0, 20000)]);
     await logAiCost(scope, String(module).trim() || "unassigned", totalTokensIn, totalTokensOut);
 
-    res.json({ response: text, action: action ? action.tool : null, tool_result: toolResult, handoff: false });
+    res.json({ response: finalText, action: lastAction, tool_result: lastToolResult, handoff: false });
   } catch (e) {
     res.status(502).json({ error: "brain respond failed: " + e.message, response: null, action: null, handoff: true });
   }
