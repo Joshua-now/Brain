@@ -573,8 +573,20 @@ app.post("/v1/brain/respond", async (req, res) => {
       if (action.tool === "find_tools") {
         const result = await TOOL_LIBRARY.find_tools.run({ scope, ...(action.args || {}) });
         (result.matches || []).forEach(m => unlocked.add(m.tool));
-        lastAction = action.tool; lastToolResult = result;
         messages[0] = { role: "system", content: RESPOND_SYS(standingBlock, [...unlocked]) };
+
+        // Don't just hope the model follows through on a single obvious match -
+        // call it now, deterministically, same reasoning as the phone-number
+        // backstop below (prompt compliance alone isn't reliable enough here).
+        if ((result.matches || []).length === 1 && TOOL_LIBRARY[result.matches[0].tool]) {
+          const autoTool = result.matches[0].tool;
+          const autoResult = await TOOL_LIBRARY[autoTool].run({ scope, module, ...(action.args || {}) });
+          lastAction = autoTool; lastToolResult = autoResult;
+          messages.push({ role: "user", content: `find_tools matched exactly one tool (${autoTool}), so it was called automatically. TOOL RESULT for ${autoTool}: ${JSON.stringify(autoResult)}\n\nNow give the final answer, plain text, no ACTION line unless you genuinely need one more tool.` });
+          continue;
+        }
+
+        lastAction = action.tool; lastToolResult = result;
         messages.push({ role: "user", content: `TOOL RESULT for find_tools: ${JSON.stringify(result)}\n\nIf any of those tools are relevant to what the customer asked, you must call one of them now with an ACTION line - do not answer the customer yet. Only skip straight to a final answer if none of the tools returned are actually relevant to the question.` });
         continue;
       }
