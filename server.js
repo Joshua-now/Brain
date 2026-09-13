@@ -21,7 +21,11 @@ const express = require("express");
 const nodePath = require("path");
 const { Pool } = require("pg");
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.PGSSL === "off" ? false : { rejectUnauthorized: false } });
+// connectionTimeoutMillis matters more than it looks: without it, a single
+// slow/flaky connect attempt (seen live: 2+ minutes over Railway's internal
+// network) hangs that long before failing, instead of failing fast so a
+// retry or a healthcheck gets a quick, honest answer either way.
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.PGSSL === "off" ? false : { rejectUnauthorized: false }, connectionTimeoutMillis: 5000 });
 const API_KEY = process.env.MEMORY_API_KEY || "";
 const REFLECT_MODEL = process.env.REFLECT_MODEL || "openai/gpt-oss-120b";
 const AUTO_REFLECT = process.env.AUTO_REFLECT !== "off";
@@ -767,11 +771,28 @@ app.get("/margin/summary", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 8080;
-initDb().then(() => {
-  app.listen(PORT, () => console.log(`[brain] listening on ${PORT}`));
-  if (AUTO_REFLECT) {
-    console.log(`[brain] auto-reflect ON — every ${REFLECT_INTERVAL_MIN} min, scopes with >= ${REFLECT_MIN_ROWS} new rows`);
-    setTimeout(autoReflectTick, 90_000); // first pass ~90s after boot
-    setInterval(autoReflectTick, REFLECT_INTERVAL_MIN * 60_000);
+
+// Listen immediately - do not make the HTTP port (and therefore any
+// healthcheck) depend on the database being reachable yet.
+app.listen(PORT, () => console.log(`[brain] listening on ${PORT}`));
+
+async function initDbWithRetry() {
+  const delays = [1000, 3000, 5000, 10000, 15000]; // ~34s of retries, then keep trying every 30s
+  for (let i = 0; ; i++) {
+    try {
+      await initDb();
+      console.log("[brain] DB ready");
+      return;
+    } catch (e) {
+      console.error(`[brain] DB init attempt ${i + 1} failed: ${e.message}`);
+      await new Promise(r => setTimeout(r, delays[Math.min(i, delays.length - 1)]));
+    }
   }
-}).catch((e) => { console.error("[brain] DB init failed:", e.message); process.exit(1); });
+}
+initDbWithRetry();
+
+if (AUTO_REFLECT) {
+  console.log(`[brain] auto-reflect ON — every ${REFLECT_INTERVAL_MIN} min, scopes with >= ${REFLECT_MIN_ROWS} new rows`);
+  setTimeout(autoReflectTick, 90_000); // first pass ~90s after boot
+  setInterval(autoReflectTick, REFLECT_INTERVAL_MIN * 60_000);
+}
