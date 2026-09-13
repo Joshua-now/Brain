@@ -220,6 +220,131 @@ async function autoReflectTick() {
   }
 }
 
+
+// ── BRAIN SOCKET ─────────────────────────────────────────────────────────────
+// One reasoning endpoint any caller (a Telnyx bot, Telegram, a website widget)
+// can ask a question instead of carrying the whole business brain itself.
+// The model underneath is a one-variable swap (RESPOND_MODEL) via OpenRouter.
+// Nothing calls this yet on purpose - it is proven standalone first.
+//
+// TOOLS below are MOSTLY STUBS during this build-out. get_business_info and
+// check_service_capability are real (they read this service's own memory
+// table). Everything else honestly reports {stub:true} rather than pretending
+// to be wired to a real CRM/calendar/SMS provider that does not exist yet.
+const TOOLS = {
+  async get_business_info({ scope }) {
+    const { rows } = await pool.query(
+      "SELECT type, content, trigger FROM memories WHERE scope=$1 ORDER BY confidence DESC, updated_at DESC LIMIT 120", [scope]);
+    return { count: rows.length, memories: rows };
+  },
+  async check_service_capability({ scope, query: q }) {
+    const term = normText(String(q || "").trim());
+    if (!term) return { matched: false, items: [] };
+    const { rows } = await pool.query(
+      "SELECT type, content, trigger FROM memories WHERE scope=$1 AND (content ILIKE $2 OR trigger ILIKE $2) ORDER BY confidence DESC LIMIT 5",
+      [scope, `%${term.slice(0, 100)}%`]);
+    return { matched: rows.length > 0, items: rows };
+  },
+  async check_service_area() { return { stub: true, note: "not wired to real service-area data yet" }; },
+  async get_pricing() { return { stub: true, note: "not wired to real pricing data yet" }; },
+  async check_calendar() { return { stub: true, note: "not wired to a real calendar yet" }; },
+  async book_appointment() { return { stub: true, note: "not wired to a real calendar yet" }; },
+  async create_lead() { return { stub: true, note: "not wired to a real CRM yet" }; },
+  async update_lead() { return { stub: true, note: "not wired to a real CRM yet" }; },
+  async notify_owner() { return { stub: true, note: "not wired to a real notification channel yet" }; },
+  async send_sms() { return { stub: true, note: "not wired to a real SMS provider yet" }; },
+  async handoff_to_human() { return { stub: true, note: "not wired to a real handoff mechanism yet" }; },
+};
+const TOOL_LIST = Object.keys(TOOLS);
+const RESPOND_MODEL = process.env.RESPOND_MODEL || REFLECT_MODEL;
+
+const RESPOND_SYS = (standingBlock) => `You are the Contractor Brain for one specific contractor. Answer the incoming message directly and briefly, the way a sharp office manager would.
+You have this business's known memory below - treat it as ground truth, do not contradict it:
+${standingBlock || "(no memory recorded yet for this contractor)"}
+
+You have tools you may call when you need information you do not already have. Available tools: ${TOOL_LIST.join(", ")}.
+Most of these tools are STUBS during this build-out and will say so in their result - if a tool result has "stub": true, tell the truth: say you do not have that wired up yet rather than making something up.
+To call a tool, end your reply with a line of the exact form:
+ACTION: {"tool":"tool_name","args":{...}}
+Only call a tool when you actually need it. If you do not need a tool, just answer.`;
+
+function parseAction(raw) {
+  const idx = raw.indexOf("ACTION:");
+  if (idx === -1) return { text: raw.trim(), action: null };
+  const text = raw.slice(0, idx).trim();
+  const tail = raw.slice(idx + 7).trim();
+  const m = tail.match(/\{[\s\S]*\}/);
+  if (!m) return { text, action: null };
+  try {
+    const parsed = JSON.parse(m[0]);
+    if (parsed && typeof parsed.tool === "string") return { text, action: parsed };
+  } catch {}
+  return { text, action: null };
+}
+
+async function callModel(messages) {
+  const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: RESPOND_MODEL, temperature: 0.3, max_tokens: 500, messages }),
+    signal: AbortSignal.timeout(30000),
+  });
+  const d = await r.json();
+  if (d?.error) throw new Error(typeof d.error === "string" ? d.error : JSON.stringify(d.error));
+  return d?.choices?.[0]?.message?.content || "";
+}
+
+app.post("/v1/brain/respond", async (req, res) => {
+  const scope = getScope(req);
+  if (!scope) return res.status(400).json({ error: "valid scope required" });
+  const { message = "", conversation_id = "" } = req.body || {};
+  if (!message) return res.status(400).json({ error: "message required" });
+  if (!process.env.OPENROUTER_API_KEY) {
+    return res.status(503).json({ error: "no model configured - set OPENROUTER_API_KEY", response: null, action: null, handoff: true });
+  }
+  try {
+    await pool.query("INSERT INTO trajectories(scope, session_id, role, content) VALUES ($1,$2,'user',$3)",
+      [scope, String(conversation_id).slice(0, 200), String(message).slice(0, 20000)]);
+
+    const { rows } = await pool.query(
+      "SELECT type, content, trigger FROM memories WHERE scope=$1 ORDER BY confidence DESC, updated_at DESC LIMIT 120", [scope]);
+    const byType = {};
+    for (const r of rows) (byType[r.type] = byType[r.type] || []).push(r);
+    const order = ["preference", "fact", "playbook", "mistake"];
+    const label = { preference: "PREFERENCES", fact: "FACTS", playbook: "PLAYBOOKS", mistake: "MISTAKES TO AVOID" };
+    let standingBlock = "";
+    for (const t of order) if (byType[t]?.length) {
+      standingBlock += `\n${label[t]}:\n` + byType[t].map(r => `- ${r.content}${r.trigger ? ` (when: ${r.trigger})` : ""}`).join("\n") + "\n";
+    }
+
+    const messages = [
+      { role: "system", content: RESPOND_SYS(standingBlock.trim()) },
+      { role: "user", content: String(message).slice(0, 4000) },
+    ];
+
+    let raw = await callModel(messages);
+    let { text, action } = parseAction(raw);
+    let toolResult = null;
+
+    if (action && TOOLS[action.tool]) {
+      toolResult = await TOOLS[action.tool]({ scope, ...(action.args || {}) });
+      messages.push({ role: "assistant", content: raw });
+      messages.push({ role: "user", content: `TOOL RESULT for ${action.tool}: ${JSON.stringify(toolResult)}\n\nNow give the final answer, plain text, no ACTION line.` });
+      raw = await callModel(messages);
+      text = raw.trim();
+    } else if (action) {
+      toolResult = { error: `unknown tool "${action.tool}"` };
+    }
+
+    await pool.query("INSERT INTO trajectories(scope, session_id, role, content) VALUES ($1,$2,'assistant',$3)",
+      [scope, String(conversation_id).slice(0, 200), text.slice(0, 20000)]);
+
+    res.json({ response: text, action: action ? action.tool : null, tool_result: toolResult, handoff: false });
+  } catch (e) {
+    res.status(502).json({ error: "brain respond failed: " + e.message, response: null, action: null, handoff: true });
+  }
+});
+
 const PORT = process.env.PORT || 8080;
 initDb().then(() => {
   app.listen(PORT, () => console.log(`[brain] listening on ${PORT}`));
