@@ -271,11 +271,14 @@ const TOOLS = {
   },
   async check_service_capability({ scope, query: q }) {
     const term = normText(String(q || "").trim());
-    if (!term) return { matched: false, items: [] };
+    if (!term) return { matched: false, items: [], note: "no search term given - this means UNKNOWN, not \"no\"" };
     const { rows } = await pool.query(
       "SELECT type, content, trigger FROM memories WHERE scope=$1 AND (content ILIKE $2 OR trigger ILIKE $2) ORDER BY confidence DESC LIMIT 5",
       [scope, `%${term.slice(0, 100)}%`]);
-    return { matched: rows.length > 0, items: rows };
+    return {
+      matched: rows.length > 0, items: rows,
+      note: rows.length > 0 ? undefined : "no memory found for this - this means UNKNOWN whether we do this, NOT a \"no\". Do not tell the customer we don't offer it.",
+    };
   },
   async check_service_area() { return { stub: true, note: "not wired to real service-area data yet" }; },
   async get_pricing() { return { stub: true, note: "not wired to real pricing data yet" }; },
@@ -317,7 +320,7 @@ ${standingBlock || "(no memory recorded yet for this contractor)"}
 You have tools you may call when you need information you do not already have. Available tools: ${TOOL_LIST.join(", ")}.
 Most of these tools are STUBS during this build-out and will say so in their result - if a tool result has "stub": true, tell the truth: say you do not have that wired up yet rather than making something up.
 
-HARD RULE: you have NO phone number, address, price, or contact detail of any kind unless it appears verbatim in the memory block above or in a tool result. Do not output any phone number, address, or price under any circumstances unless it is copied verbatim from memory or a tool result. If a customer asks to book or asks for contact info and you cannot do it yourself (a tool result says stub:true, or you have no tool for it), say exactly this kind of thing: "I cannot book that myself yet - someone from the team will follow up with you directly." Never invent a callback number or address to fill that gap.
+HARD RULE: you have NO phone number, address, price, or contact detail of any kind unless it appears verbatim in the memory block above or in a tool result. Do not output any phone number, address, or price under any circumstances unless it is copied verbatim from memory or a tool result. If a customer asks to book or asks for contact info and you cannot do it yourself (a tool result says stub:true, or you have no tool for it), say exactly this kind of thing: "I cannot book that myself yet - someone from the team will follow up with you directly." Never invent a callback number or address to fill that gap. A tool result with no match (matched: false, or an empty items list) means you do not know the answer - it is NOT evidence the business doesn't offer something. Never turn "no memory found" into "we don't do that" - say you're not sure and someone will confirm.
 To call a tool, end your reply with a line of the exact form:
 ACTION: {"tool":"tool_name","args":{...}}
 Only call a tool when you actually need it. If you do not need a tool, just answer.`;
