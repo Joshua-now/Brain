@@ -575,7 +575,7 @@ app.post("/v1/brain/respond", async (req, res) => {
         (result.matches || []).forEach(m => unlocked.add(m.tool));
         lastAction = action.tool; lastToolResult = result;
         messages[0] = { role: "system", content: RESPOND_SYS(standingBlock, [...unlocked]) };
-        messages.push({ role: "user", content: `TOOL RESULT for find_tools: ${JSON.stringify(result)}\n\nThose tools are now available if you need them. Continue - either call one of them, or give your final answer to the customer.` });
+        messages.push({ role: "user", content: `TOOL RESULT for find_tools: ${JSON.stringify(result)}\n\nIf any of those tools are relevant to what the customer asked, you must call one of them now with an ACTION line - do not answer the customer yet. Only skip straight to a final answer if none of the tools returned are actually relevant to the question.` });
         continue;
       }
 
