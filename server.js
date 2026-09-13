@@ -95,6 +95,17 @@ async function initDb() {
   `);
 }
 
+// ── CORS: lets a browser-based admin dashboard call this API directly. This is
+// NOT the security boundary - the Bearer token below is. CORS just decides
+// whether a browser will let a page from another origin make the call at all.
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 // ── Auth + scope guards ──────────────────────────────────────────────────────
 app.use((req, res, next) => {
   if (req.path === "/health") return next();
