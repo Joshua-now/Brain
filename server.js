@@ -397,16 +397,17 @@ app.post("/modules/activate", async (req, res) => {
   if (!scope) return res.status(400).json({ error: "valid scope required" });
   const module = String(req.body?.module || "").trim();
   if (!module) return res.status(400).json({ error: "module required" });
+  const activatedAtOverride = req.body?.activated_at || null; // ops/test-only backdate, mirrors /usage/log
   const { rows } = await pool.query(
     `INSERT INTO module_activations (scope, module, status, activated_at, updated_at)
-     VALUES ($1,$2,'active',now(),now())
+     VALUES ($1,$2,'active',COALESCE($3, now()),now())
      ON CONFLICT (scope, module) DO UPDATE SET
        status = 'active',
-       activated_at = CASE WHEN module_activations.status = 'active' THEN module_activations.activated_at ELSE now() END,
+       activated_at = CASE WHEN module_activations.status = 'active' THEN module_activations.activated_at ELSE COALESCE($3, now()) END,
        deactivated_at = NULL,
        updated_at = now()
      RETURNING scope, module, status, activated_at`,
-    [scope, module]);
+    [scope, module, activatedAtOverride]);
   await pool.query("INSERT INTO usage_events(scope, module, event_type, detail) VALUES ($1,$2,'invoked','activated')", [scope, module]);
   res.json({ ok: true, activation: rows[0] });
 });
