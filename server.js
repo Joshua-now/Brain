@@ -109,7 +109,12 @@ app.use((req, res, next) => {
 
 // ── Admin dashboard: served as a plain static page from this same origin, not
 // a claude.ai Artifact (Artifacts can't fetch arbitrary external hosts).
-app.use("/admin", express.static(nodePath.join(__dirname, "public")));
+// Explicit routes, not express.static's directory-index behaviour - the file
+// is admin.html, not index.html, so a bare static mount 404s/falls through
+// to the auth check on the trailing-slash redirect.
+app.get(["/admin", "/admin/"], (req, res) => {
+  res.sendFile(nodePath.join(__dirname, "public", "admin.html"));
+});
 
 // ── Auth + scope guards ──────────────────────────────────────────────────────
 app.use((req, res, next) => {
