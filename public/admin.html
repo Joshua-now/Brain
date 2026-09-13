@@ -267,6 +267,24 @@ hr.sep{border:none; border-top:1px solid hsl(var(--border)); margin:16px 0;}
             </div>
           </div>
           <div id="scopeErr" class="err"></div>
+
+          <hr class="sep">
+          <h3 style="margin:0 0 8px;font-size:14px;">Integrations</h3>
+          <p class="note" style="margin-top:0;">Link this scope to the contractor's real Field App and Lexi accounts, so the brain can log a real quote request or send a real review request during a chat. Find the tenant ID in each app's own admin/superadmin view.</p>
+          <div class="row">
+            <div class="field" style="flex:1 1 220px;">
+              <label>Field App tenant ID</label>
+              <input type="text" id="fieldAppTenantId" placeholder="uuid from Field App">
+            </div>
+            <div class="field" style="flex:1 1 220px;">
+              <label>Lexi tenant ID</label>
+              <input type="text" id="lexiTenantId" placeholder="uuid from Lexi">
+            </div>
+            <div class="field" style="flex:0 0 auto;">
+              <button class="secondary" onclick="saveIntegrations()">Save</button>
+            </div>
+          </div>
+          <div id="integrationsErr" class="err"></div>
         </div>
       </div>
     </div>
@@ -386,12 +404,39 @@ async function loadScopeList(){
     document.getElementById('scopeList').innerHTML = (data.scopes||[]).map(s => `<option value="${escapeHtml(s)}">`).join('');
   }catch(e){}
 }
+async function loadIntegrations(scope){
+  document.getElementById('fieldAppTenantId').value = '';
+  document.getElementById('lexiTenantId').value = '';
+  document.getElementById('integrationsErr').textContent = '';
+  if(!scope) return;
+  try{
+    const data = await api('/integrations/status?scope=' + encodeURIComponent(scope));
+    document.getElementById('fieldAppTenantId').value = data.field_app_tenant_id || '';
+    document.getElementById('lexiTenantId').value = data.lexi_tenant_id || '';
+  }catch(e){ document.getElementById('integrationsErr').textContent = e.message; }
+}
+
+async function saveIntegrations(){
+  const scope = document.getElementById('scopeInput').value.trim();
+  const err = document.getElementById('integrationsErr');
+  err.textContent = '';
+  if(!scope){ err.textContent = 'load a scope first'; return; }
+  try{
+    await api('/integrations/config', {method:'POST', body: JSON.stringify({
+      scope,
+      field_app_tenant_id: document.getElementById('fieldAppTenantId').value.trim(),
+      lexi_tenant_id: document.getElementById('lexiTenantId').value.trim(),
+    })});
+  }catch(e){ err.textContent = e.message; }
+}
+
 async function loadScope(){
   const scope = document.getElementById('scopeInput').value.trim();
   const box = document.getElementById('scopeModules');
   document.getElementById('scopeErr').textContent = '';
   if(!scope){ box.innerHTML = ''; return; }
   box.innerHTML = '<div class="empty">loading…</div>';
+  loadIntegrations(scope);
   try{
     const data = await api('/modules/status?scope=' + encodeURIComponent(scope));
     if(!data.modules || !data.modules.length){ box.innerHTML = '<div class="empty">No modules activated for this scope yet.</div>'; return; }

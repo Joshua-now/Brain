@@ -96,6 +96,12 @@ async function initDb() {
     ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tokens_in INTEGER;
     ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tokens_out INTEGER;
     ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cost_usd NUMERIC(12,6);
+    CREATE TABLE IF NOT EXISTS scope_integrations (
+      scope TEXT PRIMARY KEY,
+      field_app_tenant_id TEXT,
+      lexi_tenant_id TEXT,
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
 
   `);
 }
@@ -428,6 +434,60 @@ const TOOL_LIBRARY = {
       }
     },
   },
+  request_quote: {
+    description: "Log a quote request for this customer - creates a draft quote in the office's Field App so a human can price it. This is NOT a real price - never tell the customer a dollar amount from this. Args: customer_name, customer_phone, description (what they want quoted, in their own words).",
+    keywords: ["quote", "estimate", "price", "cost", "how much"],
+    async run({ scope, customer_name, customer_phone, description }) {
+      if (!customer_phone || !description) {
+        return { result: "needs_more_info", message: "Need the customer's phone number and a description of what they want quoted." };
+      }
+      const base = process.env.FIELD_APP_BASE_URL, key = process.env.FIELD_APP_MACHINE_KEY;
+      if (!base || !key) return { result: "error", message: "Quote requests aren't wired up for this business yet." };
+      const { rows } = await pool.query("SELECT field_app_tenant_id FROM scope_integrations WHERE scope=$1", [scope]);
+      const tenantId = rows[0]?.field_app_tenant_id;
+      if (!tenantId) return { result: "error", message: "This business hasn't linked its Field App account yet - someone from the team will follow up." };
+      try {
+        const r = await fetch(`${base.replace(/\/+$/, "")}/api/machine/quotes`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+          body: JSON.stringify({ tenantId, customerName: customer_name, customerPhone: customer_phone, description }),
+          signal: AbortSignal.timeout(15000),
+        });
+        const data = await r.json();
+        if (!r.ok) return { result: "error", message: data?.error || "Field App rejected the request." };
+        return { result: "logged", message: "Quote request logged - the office will follow up with real pricing.", quoteId: data.quoteId };
+      } catch (e) {
+        return { result: "error", message: "Could not reach the quote system: " + e.message };
+      }
+    },
+  },
+  request_review: {
+    description: "Send this customer a text asking for a Google review. Args: customer_name, customer_phone.",
+    keywords: ["review", "google review", "feedback", "rate us", "leave a review"],
+    async run({ scope, customer_name, customer_phone }) {
+      if (!customer_phone) {
+        return { result: "needs_more_info", message: "Need the customer's phone number to send a review request." };
+      }
+      const base = process.env.LEXI_BASE_URL, key = process.env.LEXI_MACHINE_KEY;
+      if (!base || !key) return { result: "error", message: "Review requests aren't wired up for this business yet." };
+      const { rows } = await pool.query("SELECT lexi_tenant_id FROM scope_integrations WHERE scope=$1", [scope]);
+      const tenantId = rows[0]?.lexi_tenant_id;
+      if (!tenantId) return { result: "error", message: "This business hasn't linked its Lexi account yet - someone from the team will follow up." };
+      try {
+        const r = await fetch(`${base.replace(/\/+$/, "")}/api/machine/reviews/send`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+          body: JSON.stringify({ tenantId, name: customer_name, phone: customer_phone }),
+          signal: AbortSignal.timeout(15000),
+        });
+        const data = await r.json();
+        if (!r.ok) return { result: "error", message: data?.error || "Lexi rejected the request." };
+        return { result: "sent", message: "Review request texted to the customer." };
+      } catch (e) {
+        return { result: "error", message: "Could not reach the review system: " + e.message };
+      }
+    },
+  },
   create_lead: { description: "Create a new lead/contact in the CRM.", keywords: ["lead", "new customer", "contact", "crm"], async run() { return { stub: true, note: "not wired to a real CRM yet" }; } },
   update_lead: { description: "Update an existing lead/contact in the CRM.", keywords: ["update", "lead", "contact", "crm", "note"], async run() { return { stub: true, note: "not wired to a real CRM yet" }; } },
   notify_owner: { description: "Notify the business owner directly about something urgent.", keywords: ["notify", "alert", "owner", "urgent", "tell them"], async run() { return { stub: true, note: "not wired to a real notification channel yet" }; } },
@@ -689,6 +749,35 @@ app.post("/modules/deactivate", async (req, res) => {
      WHERE scope=$1 AND module=$2 RETURNING scope, module, status, deactivated_at`,
     [scope, module]);
   res.json({ ok: true, activation: rows[0] || { scope, module, status: "inactive", note: "was never activated" } });
+});
+
+// ── INTEGRATIONS: which real Field App / Lexi tenant this scope maps to ─────
+// Brain's scope string is arbitrary and set at onboarding - it has no
+// relationship to either live app's own tenant id. This is the one place
+// that mapping is kept, so request_quote/request_review know who to call.
+app.get("/integrations/status", async (req, res) => {
+  const scope = getScope(req);
+  if (!scope) return res.status(400).json({ error: "valid scope required" });
+  const { rows } = await pool.query(
+    "SELECT field_app_tenant_id, lexi_tenant_id, updated_at FROM scope_integrations WHERE scope=$1", [scope]);
+  res.json(rows[0] || { field_app_tenant_id: null, lexi_tenant_id: null });
+});
+
+app.post("/integrations/config", async (req, res) => {
+  const scope = getScope(req);
+  if (!scope) return res.status(400).json({ error: "valid scope required" });
+  const fieldAppTenantId = req.body?.field_app_tenant_id != null ? String(req.body.field_app_tenant_id).trim() || null : undefined;
+  const lexiTenantId = req.body?.lexi_tenant_id != null ? String(req.body.lexi_tenant_id).trim() || null : undefined;
+  const { rows } = await pool.query(
+    `INSERT INTO scope_integrations (scope, field_app_tenant_id, lexi_tenant_id, updated_at)
+     VALUES ($1, $2, $3, now())
+     ON CONFLICT (scope) DO UPDATE SET
+       field_app_tenant_id = COALESCE($2, scope_integrations.field_app_tenant_id),
+       lexi_tenant_id = COALESCE($3, scope_integrations.lexi_tenant_id),
+       updated_at = now()
+     RETURNING field_app_tenant_id, lexi_tenant_id, updated_at`,
+    [scope, fieldAppTenantId, lexiTenantId]);
+  res.json({ ok: true, config: rows[0] });
 });
 
 // Every contractor scope that has ever activated a module - the admin panel's
