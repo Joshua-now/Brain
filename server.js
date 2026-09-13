@@ -159,8 +159,17 @@ async function llmReflect(text) {
 // Reflect exactly ONE scope. Shared by POST /reflect and the auto-reflect timer.
 // Every query is locked to a single scope — isolation cannot leak here.
 async function reflectScope(scope, limit = 60) {
+  // Only ever reflect what a human said. Reflecting the assistant's OWN prior
+  // answers into memory creates a feedback loop where one hallucination gets
+  // written down as a permanent "fact" or "playbook" and repeats forever -
+  // found live during testing (a fake phone number got promoted to a memorized
+  // playbook this exact way). Assistant turns still get logged for audit, they
+  // just never become something the brain treats as ground truth about itself.
   const { rows: traj } = await pool.query(
-    "SELECT id, role, content, signal FROM trajectories WHERE scope=$1 AND reflected=false ORDER BY id ASC LIMIT $2", [scope, limit]);
+    "SELECT id, role, content, signal FROM trajectories WHERE scope=$1 AND reflected=false AND role != 'assistant' ORDER BY id ASC LIMIT $2", [scope, limit]);
+  // still mark any not-yet-reflected assistant rows as reflected so they do not
+  // pile up forever waiting for a reflect pass that will never use them
+  await pool.query("UPDATE trajectories SET reflected=true WHERE scope=$1 AND reflected=false AND role='assistant'", [scope]);
   if (!traj.length) return { added: 0, reinforced: 0, reflected_rows: 0, note: "nothing new" };
   const text = traj.map(t => `${t.role}${t.signal ? ` [${t.signal}]` : ""}: ${t.content}`).join("\n").slice(-14000);
   const items = await llmReflect(text);
