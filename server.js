@@ -378,8 +378,14 @@ const TOOL_LIBRARY = {
     async run({ scope, query: q }) {
       const term = normText(String(q || "").trim());
       if (!term) return { matched: false, items: [], note: "no search term given - this means UNKNOWN, not \"no\"" };
+      // Only "fact" and "playbook" memories are ever evidence of a real business
+      // capability - a "preference" (what the CUSTOMER asks about/likes) or a
+      // "mistake to avoid" is not, and treating one as a match is how a
+      // repeated test question ("do they finance jobs?") turned into a fully
+      // fabricated "yes, 0% APR financing" answer once auto-reflect learned a
+      // preference row from it.
       const { rows } = await pool.query(
-        "SELECT type, content, trigger FROM memories WHERE scope=$1 AND (content ILIKE $2 OR trigger ILIKE $2) ORDER BY confidence DESC LIMIT 5",
+        "SELECT type, content, trigger FROM memories WHERE scope=$1 AND type IN ('fact','playbook') AND (content ILIKE $2 OR trigger ILIKE $2) ORDER BY confidence DESC LIMIT 5",
         [scope, `%${term.slice(0, 100)}%`]);
       return {
         matched: rows.length > 0, items: rows,
@@ -393,7 +399,8 @@ const TOOL_LIBRARY = {
     async run({ scope, query: q }) {
       const term = normText(String(q || "").trim());
       const params = [scope];
-      let sql = "SELECT type, content, trigger FROM memories WHERE scope=$1 AND (content ILIKE '%price%' OR content ILIKE '%cost%' OR content ILIKE '%fee%' OR content ILIKE '%$%' OR trigger ILIKE '%price%' OR trigger ILIKE '%cost%')";
+      // Same fix as check_service_capability: only fact/playbook rows count.
+      let sql = "SELECT type, content, trigger FROM memories WHERE scope=$1 AND type IN ('fact','playbook') AND (content ILIKE '%price%' OR content ILIKE '%cost%' OR content ILIKE '%fee%' OR content ILIKE '%$%' OR trigger ILIKE '%price%' OR trigger ILIKE '%cost%')";
       if (term) { sql += " AND (content ILIKE $2 OR trigger ILIKE $2)"; params.push(`%${term.slice(0, 100)}%`); }
       sql += " ORDER BY confidence DESC LIMIT 8";
       const { rows } = await pool.query(sql, params);
