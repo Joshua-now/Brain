@@ -518,16 +518,16 @@ async function callModelOnce(messages) {
 // roughly half the time on one test scope) - a real string, not an error,
 // that just trims to nothing. Retry once before accepting that as the
 // answer; tokens from both attempts count toward real cost either way.
-async function callModel(messages) {
-  const first = await callModelOnce(messages);
-  if (first.content && first.content.trim()) return first;
-  console.error("[brain] model returned blank/whitespace content, retrying once");
-  const second = await callModelOnce(messages);
-  return {
-    content: second.content,
-    tokensIn: (first.tokensIn || 0) + (second.tokensIn || 0),
-    tokensOut: (first.tokensOut || 0) + (second.tokensOut || 0),
-  };
+async function callModel(messages, label) {
+  let tokensIn = 0, tokensOut = 0;
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const r = await callModelOnce(messages);
+    tokensIn += r.tokensIn || 0; tokensOut += r.tokensOut || 0;
+    if (r.content && r.content.trim()) return { content: r.content, tokensIn, tokensOut };
+    console.error(`[brain] model returned blank/whitespace content on attempt ${attempt}/${MAX_ATTEMPTS}${label ? " (" + label + ")" : ""}`);
+  }
+  return { content: "", tokensIn, tokensOut };
 }
 
 // Logs the real $ cost of one brain call against a scope+module. This is OUR
@@ -578,9 +578,9 @@ app.post("/v1/brain/respond", async (req, res) => {
     const MAX_STEPS = 4; // find_tools -> real tool -> final answer, plus one spare
 
     for (let step = 0; step < MAX_STEPS; step++) {
-      const call = await callModel(messages);
+      const call = await callModel(messages, `loop step ${step}, scope=${scope}`);
       totalTokensIn += call.tokensIn || 0; totalTokensOut += call.tokensOut || 0;
-      if (!call.content || !call.content.trim()) console.error(`[brain] still-blank model content at step ${step} after retry, scope=${scope}, messages=${messages.length}`);
+      if (!call.content || !call.content.trim()) console.error(`[brain] still-blank model content at step ${step} after all retries, scope=${scope}, messages=${messages.length}`);
       const { text, action } = parseAction(call.content);
 
       if (!action) { finalText = text; break; }
@@ -622,8 +622,9 @@ app.post("/v1/brain/respond", async (req, res) => {
 
     if (!finalText) {
       messages.push({ role: "user", content: "Give your final answer now, plain text only, no ACTION line." });
-      const call = await callModel(messages);
+      const call = await callModel(messages, `final catch-up, scope=${scope}`);
       totalTokensIn += call.tokensIn || 0; totalTokensOut += call.tokensOut || 0;
+      if (!call.content || !call.content.trim()) console.error(`[brain] still-blank model content at final catch-up after all retries, scope=${scope}, messages=${messages.length}`);
       finalText = parseAction(call.content).text;
     }
     finalText = stripUnverifiedPhoneNumbers(finalText, standingBlock);
