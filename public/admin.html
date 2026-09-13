@@ -295,6 +295,12 @@ hr.sep{border:none; border-top:1px solid hsl(var(--border)); margin:16px 0;}
           </div>
           <div id="integrationsInfo" class="note"></div>
           <div id="integrationsErr" class="err"></div>
+
+          <hr class="sep">
+          <h3 style="margin:0 0 8px;font-size:14px;">Memories</h3>
+          <p class="note" style="margin-top:0;">Everything the brain has learned or been taught for this scope. Delete anything wrong, stale, or that got learned from repeated test traffic instead of a real customer pattern.</p>
+          <div id="memoriesList"></div>
+          <div id="memoriesErr" class="err"></div>
         </div>
       </div>
     </div>
@@ -414,6 +420,41 @@ async function loadScopeList(){
     document.getElementById('scopeList').innerHTML = (data.scopes||[]).map(s => `<option value="${escapeHtml(s)}">`).join('');
   }catch(e){}
 }
+async function loadMemories(scope){
+  const box = document.getElementById('memoriesList');
+  const err = document.getElementById('memoriesErr');
+  err.textContent = '';
+  box.innerHTML = '';
+  if(!scope) return;
+  box.innerHTML = '<div class="empty">loading…</div>';
+  try{
+    const data = await api('/memories?scope=' + encodeURIComponent(scope));
+    const items = data.items || [];
+    if(!items.length){ box.innerHTML = '<div class="empty">No memories for this scope yet.</div>'; return; }
+    const typeLabel = {fact:'FACT', playbook:'PLAYBOOK', preference:'PREFERENCE', mistake:'MISTAKE'};
+    box.innerHTML = `<div class="tablewrap"><table>
+      <thead><tr><th>Type</th><th>Content</th><th>Trigger</th><th>Hits</th><th>Updated</th><th></th></tr></thead>
+      <tbody>${items.map(m => `<tr>
+        <td>${escapeHtml(typeLabel[m.type] || m.type)}</td>
+        <td>${escapeHtml(m.content)}</td>
+        <td>${escapeHtml(m.trigger || '')}</td>
+        <td>${m.hit_count}</td>
+        <td>${m.updated_at ? new Date(m.updated_at).toLocaleDateString() : ''}</td>
+        <td><button class="secondary" onclick="deleteMemory(${m.id})">Delete</button></td>
+      </tr>`).join('')}</tbody>
+    </table></div>`;
+  }catch(e){ err.textContent = e.message; box.innerHTML = ''; }
+}
+async function deleteMemory(id){
+  const scope = document.getElementById('scopeInput').value.trim();
+  const err = document.getElementById('memoriesErr');
+  err.textContent = '';
+  if(!scope) return;
+  try{
+    await api('/memories/' + encodeURIComponent(id) + '?scope=' + encodeURIComponent(scope), {method:'DELETE'});
+    loadMemories(scope);
+  }catch(e){ err.textContent = e.message; }
+}
 async function loadIntegrations(scope){
   document.getElementById('fieldAppTenantId').value = '';
   document.getElementById('lexiTenantId').value = '';
@@ -466,6 +507,7 @@ async function loadScope(){
   if(!scope){ box.innerHTML = ''; return; }
   box.innerHTML = '<div class="empty">loading…</div>';
   loadIntegrations(scope);
+  loadMemories(scope);
   try{
     const data = await api('/modules/status?scope=' + encodeURIComponent(scope));
     if(!data.modules || !data.modules.length){ box.innerHTML = '<div class="empty">No modules activated for this scope yet.</div>'; return; }

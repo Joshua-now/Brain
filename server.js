@@ -231,6 +231,28 @@ app.get("/recall", async (req, res) => {
   res.json({ items: rows.map(({ type, content, trigger }) => ({ type, content, trigger })) });
 });
 
+// ── ADMIN: list + delete memory rows (cleanup for garbage/hallucinated rows,
+//    e.g. a `preference` row auto-reflect learned from repetitive test traffic
+//    rather than a real customer pattern). Scope-locked like everything else. ──
+app.get("/memories", async (req, res) => {
+  const scope = getScope(req);
+  if (!scope) return res.status(400).json({ error: "valid scope required" });
+  const { rows } = await pool.query(
+    "SELECT id, type, content, trigger, confidence, hit_count, created_at, updated_at, last_used FROM memories WHERE scope=$1 ORDER BY updated_at DESC LIMIT 500",
+    [scope]);
+  res.json({ items: rows });
+});
+
+app.delete("/memories/:id", async (req, res) => {
+  const scope = getScope(req);
+  if (!scope) return res.status(400).json({ error: "valid scope required" });
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: "valid id required" });
+  const { rowCount } = await pool.query("DELETE FROM memories WHERE id=$1 AND scope=$2", [id, scope]);
+  if (!rowCount) return res.status(404).json({ error: "not found for this scope (wrong id or wrong scope)" });
+  res.json({ ok: true, deleted: id });
+});
+
 // ── REFLECTOR core ───────────────────────────────────────────────────────────
 const REFLECT_SYS = `You are the reflection engine for an AI agent's long-term memory. You are given recent raw interactions for ONE scope, each optionally tagged with an outcome signal. Extract only DURABLE, reusable memory worth recalling next time.
 Rules:
