@@ -564,6 +564,7 @@ app.post("/v1/brain/respond", async (req, res) => {
     for (let step = 0; step < MAX_STEPS; step++) {
       const call = await callModel(messages);
       totalTokensIn += call.tokensIn || 0; totalTokensOut += call.tokensOut || 0;
+      if (!call.content) console.error(`[brain] EMPTY model content at step ${step}, scope=${scope}, messages=${messages.length}`);
       const { text, action } = parseAction(call.content);
 
       if (!action) { finalText = text; break; }
@@ -610,6 +611,10 @@ app.post("/v1/brain/respond", async (req, res) => {
       finalText = parseAction(call.content).text;
     }
     finalText = stripUnverifiedPhoneNumbers(finalText, standingBlock);
+    if (!finalText.trim()) {
+      console.error(`[brain] finalText still empty after fallback retry, scope=${scope} - serving safe default`);
+      finalText = "I'm not sure about that one - someone from our team will follow up with you directly.";
+    }
 
     await pool.query("INSERT INTO trajectories(scope, session_id, role, content) VALUES ($1,$2,'assistant',$3)",
       [scope, String(conversation_id).slice(0, 200), finalText.slice(0, 20000)]);
