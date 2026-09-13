@@ -368,7 +368,7 @@ const TOOL_LIBRARY = {
   },
   check_service_capability: {
     description: "Check whether this business services a specific thing (a brand, a system type, a job type). Pass {\"query\": \"mini split\"}.",
-    keywords: ["service", "offer", "do you", "capability", "repair", "install", "brand"],
+    keywords: ["service", "offer", "do you", "capability", "repair", "install", "brand", "finance", "financing", "payment plan", "warranty"],
     async run({ scope, query: q }) {
       const term = normText(String(q || "").trim());
       if (!term) return { matched: false, items: [], note: "no search term given - this means UNKNOWN, not \"no\"" };
@@ -472,7 +472,7 @@ Most non-core tools are STUBS during this build-out and will say so in their res
 HARD RULE: you have NO phone number, address, price, or contact detail of any kind unless it appears verbatim in the memory block above or in a tool result. Do not output any phone number, address, or price under any circumstances unless it is copied verbatim from memory or a tool result. If a customer asks to book or asks for contact info and you cannot do it yourself (a tool result says stub:true, or you have no tool for it), say exactly this kind of thing: "I cannot book that myself yet - someone from the team will follow up with you directly." Never invent a callback number or address to fill that gap. A tool result with no match (matched: false, or an empty items list) means you do not know the answer - it is NOT evidence the business doesn't offer something. Never turn "no memory found" into "we don't do that" - say you're not sure and someone will confirm.
 To call a tool, end your reply with a line of the exact form:
 ACTION: {"tool":"tool_name","args":{...}}
-Only call a tool when you actually need it. If you do not need a tool, just answer.`;
+Only call a tool when you actually need it - a greeting or thank-you needs no tool. But if the customer asks anything about what THIS business does, offers, charges, financing, service area, hours, or any other business-specific fact, and that fact is not already sitting in the memory block above, you must check before answering - call find_tools (or a tool you already have loaded) first. Do not skip straight to "we don't have that" or "I'm not sure" without checking a tool - only say that AFTER a tool comes back with no match.`;
 
 // A hard, code-level backstop: no model can be fully talked out of inventing a
 // phone number via prompt alone (555-xxxx is the universal fake-number reflex
