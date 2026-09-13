@@ -27,6 +27,17 @@ const AUTO_REFLECT = process.env.AUTO_REFLECT !== "off";
 const REFLECT_INTERVAL_MIN = Math.max(parseInt(process.env.REFLECT_INTERVAL_MIN) || 180, 5);
 const REFLECT_MIN_ROWS = Math.max(parseInt(process.env.REFLECT_MIN_ROWS) || 3, 1);
 
+// Normalize typographic punctuation (smart hyphens/dashes/quotes) to plain ASCII so
+// keyword recall matches what a human actually types, even when an LLM's reflected
+// output uses "smart" characters (e.g. "mini\u2011split" vs "mini-split").
+function normText(s) {
+  return String(s)
+    .replace(/[\u2010\u2011\u2012\u2013\u2014\u2015]/g, "-")
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"');
+}
+
+
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
@@ -107,7 +118,7 @@ app.get("/standing", async (req, res) => {
 app.get("/recall", async (req, res) => {
   const scope = getScope(req);
   if (!scope) return res.status(400).json({ error: "valid scope required" });
-  const q = String(req.query.q || "").trim();
+  const q = normText(String(req.query.q || "").trim());
   const limit = Math.min(parseInt(req.query.limit) || 8, 30);
   let rows;
   if (q) {
@@ -155,9 +166,9 @@ async function reflectScope(scope, limit = 60) {
   const items = await llmReflect(text);
   let added = 0, reinforced = 0;
   for (const it of (Array.isArray(items) ? items : [])) {
-    const content = String(it?.content || "").trim(); if (!content) continue;
+    const content = normText(String(it?.content || "").trim()); if (!content) continue;
     const type = ["fact", "playbook", "preference", "mistake"].includes(it?.type) ? it.type : "fact";
-    const trigger = String(it?.trigger || "").slice(0, 300);
+    const trigger = normText(String(it?.trigger || "").slice(0, 300));
     const dup = await pool.query("SELECT id FROM memories WHERE scope=$1 AND content=$2 LIMIT 1", [scope, content.slice(0, 2000)]);
     if (dup.rowCount) {
       // early CURATOR: reinforce instead of duplicate.
