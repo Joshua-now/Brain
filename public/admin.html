@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Brain Admin</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@500;600;700&display=swap">
+<style>
+:root{
+  --font-sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  --font-display:'Outfit',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  /* Same palette family as the Lexi dashboard - professional blue/slate */
+  --background:210 40% 98%; --foreground:222 47% 11%;
+  --card:0 0% 100%; --card-foreground:222 47% 11%;
+  --primary:221 83% 53%; --primary-foreground:210 40% 98%;
+  --secondary:210 40% 96%; --secondary-foreground:222 47% 11%;
+  --muted:210 40% 96%; --muted-foreground:215 16% 47%;
+  --accent:199 89% 48%; --accent-foreground:210 40% 98%;
+  --destructive:0 84% 60%; --destructive-foreground:210 40% 98%;
+  --border:214 32% 91%; --input:214 32% 91%; --ring:221 83% 53%;
+  --good:142 71% 35%; --radius:.75rem;
+  --sidebar-bg:0 0% 100%;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --background:222 47% 9%; --foreground:210 40% 96%;
+    --card:222 40% 13%; --card-foreground:210 40% 96%;
+    --primary:217 91% 65%; --primary-foreground:222 47% 9%;
+    --secondary:222 30% 18%; --secondary-foreground:210 40% 96%;
+    --muted:222 30% 18%; --muted-foreground:215 20% 65%;
+    --accent:199 89% 58%; --accent-foreground:222 47% 9%;
+    --destructive:0 72% 60%; --destructive-foreground:210 40% 98%;
+    --border:222 25% 22%; --input:222 25% 22%; --ring:217 91% 65%;
+    --good:142 60% 50%; --sidebar-bg:222 44% 11%;
+  }
+}
+:root[data-theme="dark"]{
+  --background:222 47% 9%; --foreground:210 40% 96%;
+  --card:222 40% 13%; --card-foreground:210 40% 96%;
+  --primary:217 91% 65%; --primary-foreground:222 47% 9%;
+  --secondary:222 30% 18%; --secondary-foreground:210 40% 96%;
+  --muted:222 30% 18%; --muted-foreground:215 20% 65%;
+  --accent:199 89% 58%; --accent-foreground:222 47% 9%;
+  --destructive:0 72% 60%; --destructive-foreground:210 40% 98%;
+  --border:222 25% 22%; --input:222 25% 22%; --ring:217 91% 65%;
+  --good:142 60% 50%; --sidebar-bg:222 44% 11%;
+}
+*{box-sizing:border-box;}
+body{
+  background:hsl(var(--background)); color:hsl(var(--foreground));
+  font-family:var(--font-sans); -webkit-font-smoothing:antialiased;
+  display:flex; min-height:100vh; margin:0;
+}
+h1,h2,h3{font-family:var(--font-display); letter-spacing:-.01em; margin:0;}
+a{color:hsl(var(--primary));}
+
+/* ── Sidebar ─────────────────────────────────────────────────────────── */
+.sidebar{
+  width:256px; flex:none; background:hsl(var(--sidebar-bg)); border-right:1px solid hsl(var(--border));
+  position:fixed; top:0; bottom:0; left:0; display:flex; flex-direction:column; z-index:20;
+  transition:transform .25s ease; box-shadow:1px 0 3px rgba(0,0,0,.03);
+}
+.brand{padding:22px 20px; border-bottom:1px solid hsl(var(--border) / .6); display:flex; align-items:center; gap:10px;}
+.brand .badge{background:hsl(var(--primary)); color:hsl(var(--primary-foreground)); font-weight:700; font-size:.8rem; padding:6px 8px; border-radius:8px; font-family:var(--font-display);}
+.brand h1{font-size:1.15rem; font-weight:700; color:hsl(var(--primary));}
+.brand .tag{font-size:.65rem; color:hsl(var(--muted-foreground)); font-weight:500; text-transform:uppercase; letter-spacing:.04em; margin-top:1px;}
+nav.navlist{flex:1; padding:14px 12px; display:flex; flex-direction:column; gap:2px; overflow-y:auto;}
+.navitem{
+  display:flex; align-items:center; gap:11px; padding:9px 12px; border-radius:8px; font-size:.87rem; font-weight:500;
+  color:hsl(var(--muted-foreground)); cursor:pointer; transition:background .15s,color .15s; user-select:none;
+}
+.navitem:hover{background:hsl(var(--muted)); color:hsl(var(--foreground));}
+.navitem.active{background:hsl(var(--primary) / .1); color:hsl(var(--primary));}
+.navitem svg{width:17px; height:17px; flex:none;}
+.sidebar-foot{padding:14px 20px; border-top:1px solid hsl(var(--border) / .6); display:flex; align-items:center; gap:9px;}
+.dot{width:8px; height:8px; border-radius:50%; flex:none;}
+.dot.on{background:hsl(var(--good));} .dot.off{background:hsl(var(--destructive));}
+.sidebar-foot .lbl{font-size:.78rem; color:hsl(var(--muted-foreground));}
+
+/* ── Mobile ──────────────────────────────────────────────────────────── */
+.mobilebar{display:none;}
+.overlay{display:none;}
+@media (max-width:860px){
+  .sidebar{transform:translateX(-100%);}
+  .sidebar.open{transform:translateX(0);}
+  .mobilebar{
+    display:flex; position:sticky; top:0; z-index:10; background:hsl(var(--card)); border-bottom:1px solid hsl(var(--border));
+    padding:14px 16px; align-items:center; justify-content:space-between; width:100%;
+  }
+  .mobilebar h1{font-size:1.05rem; color:hsl(var(--primary));}
+  .mobilebar button.icon{background:none; border:none; padding:4px; color:hsl(var(--foreground));}
+  .overlay.show{display:block; position:fixed; inset:0; background:rgba(0,0,0,.35); z-index:15;}
+  .main{margin-left:0 !important;}
+}
+
+/* ── Main ────────────────────────────────────────────────────────────── */
+.main{flex:1; margin-left:256px; min-width:0; display:flex; flex-direction:column;}
+.content{padding:28px 32px 60px; max-width:1180px; width:100%; margin:0 auto;}
+.view{display:none;}
+.view.active{display:block;}
+.pagehead{margin-bottom:22px;}
+.pagehead h2{font-size:1.55rem; font-weight:700;}
+.pagehead p{color:hsl(var(--muted-foreground)); margin-top:4px; font-size:.92rem;}
+
+/* ── Cards ───────────────────────────────────────────────────────────── */
+.card{
+  background:hsl(var(--card)); color:hsl(var(--card-foreground)); border:1px solid hsl(var(--border) / .6);
+  border-radius:var(--radius); box-shadow:0 1px 2px rgba(0,0,0,.03); margin-bottom:18px;
+}
+.card-head{padding:16px 18px 0; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px;}
+.card-head h3{font-size:1rem; font-weight:600;}
+.card-body{padding:16px 18px 18px;}
+
+.grid3{display:grid; gap:14px; grid-template-columns:repeat(3,1fr);}
+@media (max-width:760px){.grid3{grid-template-columns:1fr;}}
+.stat{padding:16px 18px;}
+.stat .n{font-size:1.6rem; font-weight:700; font-family:var(--font-display);}
+.stat .l{font-size:.78rem; color:hsl(var(--muted-foreground)); margin-top:2px;}
+
+/* ── Forms ───────────────────────────────────────────────────────────── */
+.row{display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; margin-bottom:4px;}
+.field{flex:1 1 170px; min-width:130px;}
+label{font-size:.78rem; color:hsl(var(--muted-foreground)); display:block; margin-bottom:5px; font-weight:500;}
+input,select{
+  width:100%; background:hsl(var(--background)); color:hsl(var(--foreground)); border:1px solid hsl(var(--input));
+  border-radius:8px; padding:8px 11px; font-size:.87rem; font-family:var(--font-sans);
+}
+input:focus,select:focus{outline:2px solid hsl(var(--ring) / .4); border-color:hsl(var(--ring));}
+button{
+  background:hsl(var(--primary)); color:hsl(var(--primary-foreground)); border:none; border-radius:8px;
+  padding:9px 15px; font-size:.85rem; font-weight:600; cursor:pointer; white-space:nowrap; font-family:var(--font-sans);
+  transition:opacity .15s;
+}
+button:hover{opacity:.9;}
+button.secondary{background:hsl(var(--secondary)); color:hsl(var(--secondary-foreground)); border:1px solid hsl(var(--border));}
+button.destructive{background:hsl(var(--destructive)); color:hsl(var(--destructive-foreground));}
+button:disabled{opacity:.5; cursor:default;}
+
+/* ── Tables ──────────────────────────────────────────────────────────── */
+.tablewrap{overflow-x:auto; border:1px solid hsl(var(--border) / .7); border-radius:10px;}
+table{border-collapse:collapse; width:100%; font-size:.86rem;}
+th,td{text-align:left; padding:10px 14px; border-bottom:1px solid hsl(var(--border) / .6); white-space:nowrap;}
+th{color:hsl(var(--muted-foreground)); font-weight:600; font-size:.72rem; text-transform:uppercase; letter-spacing:.03em; background:hsl(var(--muted) / .5);}
+tbody tr:hover td{background:hsl(var(--muted) / .4);}
+tbody tr:last-child td{border-bottom:none;}
+
+/* ── Badges / misc ───────────────────────────────────────────────────── */
+.badge{display:inline-flex; align-items:center; gap:5px; font-size:.72rem; font-weight:600; padding:3px 9px; border-radius:20px;}
+.badge.good{background:hsl(var(--good) / .12); color:hsl(var(--good));}
+.badge.muted{background:hsl(var(--muted)); color:hsl(var(--muted-foreground));}
+.badge.bad{background:hsl(var(--destructive) / .1); color:hsl(var(--destructive));}
+.margin-pos{color:hsl(var(--good)); font-weight:600;}
+.margin-neg{color:hsl(var(--destructive)); font-weight:700;}
+.empty{color:hsl(var(--muted-foreground)); font-size:.86rem; padding:20px 4px; text-align:center;}
+.note{color:hsl(var(--muted-foreground)); font-size:.78rem; margin-top:10px; line-height:1.5;}
+.err{color:hsl(var(--destructive)); font-size:.82rem; margin-top:8px;}
+pre{
+  background:hsl(var(--muted) / .5); border:1px solid hsl(var(--border)); border-radius:8px; padding:12px;
+  font-size:.78rem; white-space:pre-wrap; word-break:break-word; max-height:280px; overflow:auto; font-family:ui-monospace,monospace;
+}
+hr.sep{border:none; border-top:1px solid hsl(var(--border)); margin:16px 0;}
+</style>
+</head>
+<body>
+
+<div class="sidebar" id="sidebar">
+  <div class="brand">
+    <span class="badge">BR</span>
+    <div><h1>Brain Admin</h1><div class="tag">Internal ops only</div></div>
+  </div>
+  <nav class="navlist" id="navlist">
+    <div class="navitem active" data-view="overview" onclick="showView('overview')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>
+      Overview
+    </div>
+    <div class="navitem" data-view="contractors" onclick="showView('contractors')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+      Contractors
+    </div>
+    <div class="navitem" data-view="test" onclick="showView('test')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      Test console
+    </div>
+    <div class="navitem" data-view="connection" onclick="showView('connection')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      Connection
+    </div>
+  </nav>
+  <div class="sidebar-foot">
+    <span class="dot off" id="connDot"></span>
+    <span class="lbl" id="connLbl">not connected</span>
+  </div>
+</div>
+<div class="overlay" id="overlay" onclick="closeMobile()"></div>
+
+<div class="main">
+  <div class="mobilebar">
+    <h1>Brain Admin</h1>
+    <button class="icon" onclick="openMobile()">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/></svg>
+    </button>
+  </div>
+
+  <div class="content">
+
+    <div class="view active" id="view-overview">
+      <div class="pagehead">
+        <h2>Overview</h2>
+        <p>What every contractor actually costs vs. what they're charged. Token cost only — does not include Railway compute or telephony minutes.</p>
+      </div>
+
+      <div class="grid3" id="ovStats">
+        <div class="card stat"><div class="n" id="statContractors">—</div><div class="l">contractors with AI activity</div></div>
+        <div class="card stat"><div class="n" id="statCost">—</div><div class="l">total AI cost this month</div></div>
+        <div class="card stat"><div class="n" id="statMargin">—</div><div class="l">total margin this month</div></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h3>All contractors — margin by module</h3>
+          <div class="row" style="margin:0;">
+            <input type="month" id="ovMonth" style="width:150px;">
+            <button class="secondary" onclick="loadOverview()">Refresh</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="tablewrap">
+            <table id="ovTable">
+              <thead><tr><th>Scope</th><th>Module</th><th>AI calls</th><th>AI cost</th><th>Price</th><th>Margin</th></tr></thead>
+              <tbody><tr><td colspan="6" class="empty">Connect on the Connection tab, then Refresh.</td></tr></tbody>
+            </table>
+          </div>
+          <div class="note">Only contractors with at least one AI call this month show up here. Use the Contractors tab to look up one that hasn't been used yet.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="view" id="view-contractors">
+      <div class="pagehead">
+        <h2>Contractors</h2>
+        <p>Look up a contractor's modules, see if they're billable yet, and turn modules on or off.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-body">
+          <div class="row">
+            <div class="field" style="flex:2 1 220px;">
+              <label>Scope</label>
+              <input type="text" id="scopeInput" placeholder="tenant:acme-air" list="scopeList">
+              <datalist id="scopeList"></datalist>
+            </div>
+            <div class="field" style="flex:0 0 auto;">
+              <button class="secondary" onclick="loadScope()">Load modules</button>
+            </div>
+          </div>
+
+          <div id="scopeModules"></div>
+
+          <hr class="sep">
+          <div class="row">
+            <div class="field" style="flex:1 1 200px;">
+              <label>Module name to activate</label>
+              <input type="text" id="newModule" placeholder="speed_to_lead / lexi / field_app">
+            </div>
+            <div class="field" style="flex:0 0 auto;">
+              <button onclick="activateModule()">Activate for this scope</button>
+            </div>
+          </div>
+          <div id="scopeErr" class="err"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="view" id="view-test">
+      <div class="pagehead">
+        <h2>Test console</h2>
+        <p>Talk to a contractor's brain directly — every message here logs real cost, same as production.</p>
+      </div>
+      <div class="card">
+        <div class="card-body">
+          <div class="row">
+            <div class="field"><label>Scope</label><input type="text" id="testScope" placeholder="tenant:acme-air"></div>
+            <div class="field"><label>Module (for cost tagging)</label><input type="text" id="testModule" placeholder="speed_to_lead"></div>
+          </div>
+          <div class="row">
+            <div class="field" style="flex:3 1 300px;"><label>Message</label><input type="text" id="testMessage" placeholder="Hey, do you service mini-splits?"></div>
+            <div class="field" style="flex:0 0 auto;"><button onclick="sendTest()">Send</button></div>
+          </div>
+          <pre id="testOut">(response will show here)</pre>
+        </div>
+      </div>
+    </div>
+
+    <div class="view" id="view-connection">
+      <div class="pagehead">
+        <h2>Connection</h2>
+        <p>Points this panel at the Brain service. Saved only in this browser — never sent anywhere but the Brain service itself.</p>
+      </div>
+      <div class="card">
+        <div class="card-body">
+          <div class="row">
+            <div class="field" style="flex:2 1 260px;"><label>Brain base URL</label><input type="text" id="baseUrl" placeholder="https://brain-production-05ae.up.railway.app"></div>
+            <div class="field" style="flex:2 1 220px;"><label>API key (MEMORY_API_KEY)</label><input type="password" id="apiKey" placeholder="paste key"></div>
+            <div class="field" style="flex:0 0 auto;"><button onclick="connect()">Connect</button></div>
+          </div>
+          <div id="connErr" class="err"></div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+function showView(name){
+  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+  document.getElementById('view-'+name).classList.add('active');
+  document.querySelectorAll('.navitem').forEach(n => n.classList.toggle('active', n.dataset.view === name));
+  closeMobile();
+}
+function openMobile(){ document.getElementById('sidebar').classList.add('open'); document.getElementById('overlay').classList.add('show'); }
+function closeMobile(){ document.getElementById('sidebar').classList.remove('open'); document.getElementById('overlay').classList.remove('show'); }
+
+function getConn(){
+  return { base: (localStorage.getItem('brain_base')||'').replace(/\/$/,''), key: localStorage.getItem('brain_key')||'' };
+}
+function setConnUI(ok, msg){
+  document.getElementById('connDot').className = 'dot ' + (ok ? 'on' : 'off');
+  document.getElementById('connLbl').textContent = ok ? 'connected' : 'not connected';
+  document.getElementById('connErr').textContent = msg || '';
+}
+async function api(path, opts){
+  const {base, key} = getConn();
+  if(!base || !key) throw new Error('not connected — set this up on the Connection tab');
+  const res = await fetch(base + path, Object.assign({}, opts, {
+    headers: Object.assign({ 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' }, (opts && opts.headers) || {})
+  }));
+  let data = null;
+  try { data = await res.json(); } catch(e) {}
+  if(!res.ok) throw new Error((data && (data.error||JSON.stringify(data))) || ('HTTP ' + res.status));
+  return data;
+}
+async function connect(){
+  const base = document.getElementById('baseUrl').value.trim();
+  const key = document.getElementById('apiKey').value.trim();
+  if(!base || !key){ setConnUI(false, 'enter both a base URL and a key'); return; }
+  try{ localStorage.setItem('brain_base', base); localStorage.setItem('brain_key', key); }catch(e){}
+  try{
+    await api('/admin/scopes');
+    setConnUI(true, '');
+    document.getElementById('ovMonth').value = new Date().toISOString().slice(0,7);
+    loadOverview();
+    loadScopeList();
+  }catch(e){ setConnUI(false, e.message); }
+}
+function fmtMoney(n){ return '$' + Number(n).toFixed(Math.abs(n) < 1 && n !== 0 ? 6 : 2); }
+async function loadOverview(){
+  const tbody = document.querySelector('#ovTable tbody');
+  const month = document.getElementById('ovMonth').value;
+  try{
+    const data = await api('/margin/summary' + (month ? ('?month='+month) : ''));
+    const rows = data.rows || [];
+    const scopes = new Set(rows.map(r => r.scope));
+    const totalCost = rows.reduce((s,r) => s + (r.ai_cost_usd||0), 0);
+    const totalMargin = rows.reduce((s,r) => s + (r.margin_usd||0), 0);
+    document.getElementById('statContractors').textContent = scopes.size;
+    document.getElementById('statCost').textContent = fmtMoney(totalCost);
+    document.getElementById('statMargin').textContent = fmtMoney(totalMargin);
+    if(!rows.length){ tbody.innerHTML = '<tr><td colspan="6" class="empty">No AI activity logged for this month yet.</td></tr>'; return; }
+    tbody.innerHTML = rows.map(r => {
+      const marginClass = (r.margin_usd == null) ? '' : (r.margin_usd < 0 ? 'margin-neg' : 'margin-pos');
+      return `<tr>
+        <td>${escapeHtml(r.scope)}</td>
+        <td>${escapeHtml(r.module)}</td>
+        <td>${r.ai_calls}</td>
+        <td>${fmtMoney(r.ai_cost_usd)}</td>
+        <td>${r.price_usd != null ? fmtMoney(r.price_usd) : '—'}</td>
+        <td class="${marginClass}">${r.margin_usd != null ? fmtMoney(r.margin_usd) : '—'}</td>
+      </tr>`;
+    }).join('');
+  }catch(e){ tbody.innerHTML = `<tr><td colspan="6" class="empty">${escapeHtml(e.message)}</td></tr>`; }
+}
+async function loadScopeList(){
+  try{
+    const data = await api('/admin/scopes');
+    document.getElementById('scopeList').innerHTML = (data.scopes||[]).map(s => `<option value="${escapeHtml(s)}">`).join('');
+  }catch(e){}
+}
+async function loadScope(){
+  const scope = document.getElementById('scopeInput').value.trim();
+  const box = document.getElementById('scopeModules');
+  document.getElementById('scopeErr').textContent = '';
+  if(!scope){ box.innerHTML = ''; return; }
+  box.innerHTML = '<div class="empty">loading…</div>';
+  try{
+    const data = await api('/modules/status?scope=' + encodeURIComponent(scope));
+    if(!data.modules || !data.modules.length){ box.innerHTML = '<div class="empty">No modules activated for this scope yet.</div>'; return; }
+    const rows = await Promise.all(data.modules.map(async m => {
+      let margin = null;
+      try{ margin = await api(`/margin/status?scope=${encodeURIComponent(scope)}&module=${encodeURIComponent(m.module)}`); }catch(e){}
+      let usage = null;
+      try{ usage = await api(`/usage/status?scope=${encodeURIComponent(scope)}&module=${encodeURIComponent(m.module)}`); }catch(e){}
+      return {m, margin, usage};
+    }));
+    box.innerHTML = `<div class="tablewrap" style="margin-top:14px;"><table>
+      <thead><tr><th>Module</th><th>Status</th><th>Billable</th><th>Margin (this month)</th><th></th></tr></thead>
+      <tbody>${rows.map(({m,margin,usage}) => `
+        <tr>
+          <td>${escapeHtml(m.module)}</td>
+          <td><span class="badge ${m.status==='active'?'good':'muted'}">${m.status}</span></td>
+          <td>${usage ? (usage.billable ? '<span class="badge good">billable</span> '+escapeHtml(usage.reason) : '<span class="badge muted">grace</span> '+escapeHtml(usage.reason)) : '—'}</td>
+          <td>${margin && margin.margin_usd!=null ? fmtMoney(margin.margin_usd)+' / '+fmtMoney(margin.price_usd) : '—'}</td>
+          <td>${m.status==='active'
+              ? `<button class="destructive" onclick="deactivateModule('${escapeAttr(scope)}','${escapeAttr(m.module)}')">Deactivate</button>`
+              : `<button class="secondary" onclick="reactivateModule('${escapeAttr(scope)}','${escapeAttr(m.module)}')">Reactivate</button>`}</td>
+        </tr>`).join('')}</tbody>
+    </table></div>`;
+  }catch(e){ box.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`; }
+}
+async function activateModule(){
+  const scope = document.getElementById('scopeInput').value.trim();
+  const module = document.getElementById('newModule').value.trim();
+  const err = document.getElementById('scopeErr');
+  err.textContent = '';
+  if(!scope || !module){ err.textContent = 'need both a scope and a module name'; return; }
+  try{
+    await api('/modules/activate', {method:'POST', body: JSON.stringify({scope, module})});
+    document.getElementById('newModule').value = '';
+    loadScope(); loadScopeList();
+  }catch(e){ err.textContent = e.message; }
+}
+async function deactivateModule(scope, module){
+  try{ await api('/modules/deactivate', {method:'POST', body: JSON.stringify({scope, module})}); loadScope(); }
+  catch(e){ document.getElementById('scopeErr').textContent = e.message; }
+}
+async function reactivateModule(scope, module){
+  try{ await api('/modules/activate', {method:'POST', body: JSON.stringify({scope, module})}); loadScope(); }
+  catch(e){ document.getElementById('scopeErr').textContent = e.message; }
+}
+async function sendTest(){
+  const scope = document.getElementById('testScope').value.trim();
+  const module = document.getElementById('testModule').value.trim() || 'unassigned';
+  const message = document.getElementById('testMessage').value.trim();
+  const out = document.getElementById('testOut');
+  if(!scope || !message){ out.textContent = 'need a scope and a message'; return; }
+  out.textContent = 'sending…';
+  try{
+    const data = await api('/v1/brain/respond', {method:'POST', body: JSON.stringify({scope, module, message})});
+    out.textContent = JSON.stringify(data, null, 2);
+    loadOverview();
+  }catch(e){ out.textContent = 'error: ' + e.message; }
+}
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function escapeAttr(s){ return String(s).replace(/'/g, "\\'"); }
+
+(function init(){
+  try{
+    let {base, key} = getConn();
+    if(!base){ base = location.origin; try{ localStorage.setItem('brain_base', base); }catch(e){} }
+    document.getElementById('baseUrl').value = base;
+    if(key) document.getElementById('apiKey').value = key;
+    if(base && key) connect(); else showView('connection');
+  }catch(e){}
+})();
+</script>
+</body>
+</html>

@@ -18,6 +18,7 @@
  *      REFLECT_MIN_ROWS? (default 3)
  */
 const express = require("express");
+const nodePath = require("path");
 const { Pool } = require("pg");
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.PGSSL === "off" ? false : { rejectUnauthorized: false } });
@@ -105,6 +106,10 @@ app.use((req, res, next) => {
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
+
+// ── Admin dashboard: served as a plain static page from this same origin, not
+// a claude.ai Artifact (Artifacts can't fetch arbitrary external hosts).
+app.use("/admin", express.static(nodePath.join(__dirname, "public")));
 
 // ── Auth + scope guards ──────────────────────────────────────────────────────
 app.use((req, res, next) => {
