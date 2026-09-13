@@ -627,10 +627,18 @@ app.post("/v1/brain/respond", async (req, res) => {
     }
     standingBlock = standingBlock.trim();
 
-    // Progressive tool disclosure: start with only the "always" tools loaded.
-    // find_tools unlocks more, mid-conversation, as the model asks for them -
-    // never the full library dumped into the prompt up front.
-    const unlocked = new Set(Object.keys(TOOL_LIBRARY).filter(n => TOOL_LIBRARY[n].always));
+    // Progressive tool disclosure: start with only the "always" tools loaded,
+    // PLUS anything whose own keywords are sitting right in the customer's
+    // first message - same matching logic as find_tools, run proactively so
+    // an obvious match doesn't depend on the model deciding to go look for
+    // it. This is the fix for the residual miss rate found live: the skips
+    // were happening at "should I call find_tools at all", not after.
+    const firstMessageText = normText(String(message || "").toLowerCase());
+    const unlocked = new Set(Object.keys(TOOL_LIBRARY).filter(n => {
+      const t = TOOL_LIBRARY[n];
+      if (t.always) return true;
+      return (t.keywords || []).some(k => firstMessageText.includes(k));
+    }));
     const messages = [
       { role: "system", content: RESPOND_SYS(standingBlock, [...unlocked]) },
       { role: "user", content: String(message).slice(0, 4000) },
