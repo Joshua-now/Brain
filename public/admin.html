@@ -270,7 +270,16 @@ hr.sep{border:none; border-top:1px solid hsl(var(--border)); margin:16px 0;}
 
           <hr class="sep">
           <h3 style="margin:0 0 8px;font-size:14px;">Integrations</h3>
-          <p class="note" style="margin-top:0;">Link this scope to the contractor's real Field App and Lexi accounts, so the brain can log a real quote request or send a real review request during a chat. Find the tenant ID in each app's own admin/superadmin view.</p>
+          <p class="note" style="margin-top:0;">Link this scope to the contractor's real Field App and Lexi accounts, so the brain can log a real quote request or send a real review request during a chat.</p>
+          <div class="row">
+            <div class="field" style="flex:1 1 220px;">
+              <label>Contractor's business email</label>
+              <input type="text" id="integrationsEmail" placeholder="same email they signed up to Field App / Lexi with">
+            </div>
+            <div class="field" style="flex:0 0 auto;">
+              <button class="secondary" onclick="lookupIntegrations()">Look up</button>
+            </div>
+          </div>
           <div class="row">
             <div class="field" style="flex:1 1 220px;">
               <label>Field App tenant ID</label>
@@ -284,6 +293,7 @@ hr.sep{border:none; border-top:1px solid hsl(var(--border)); margin:16px 0;}
               <button class="secondary" onclick="saveIntegrations()">Save</button>
             </div>
           </div>
+          <div id="integrationsInfo" class="note"></div>
           <div id="integrationsErr" class="err"></div>
         </div>
       </div>
@@ -408,12 +418,31 @@ async function loadIntegrations(scope){
   document.getElementById('fieldAppTenantId').value = '';
   document.getElementById('lexiTenantId').value = '';
   document.getElementById('integrationsErr').textContent = '';
+  document.getElementById('integrationsInfo').textContent = '';
+  document.getElementById('integrationsEmail').value = '';
   if(!scope) return;
   try{
     const data = await api('/integrations/status?scope=' + encodeURIComponent(scope));
     document.getElementById('fieldAppTenantId').value = data.field_app_tenant_id || '';
     document.getElementById('lexiTenantId').value = data.lexi_tenant_id || '';
   }catch(e){ document.getElementById('integrationsErr').textContent = e.message; }
+}
+
+async function lookupIntegrations(){
+  const email = document.getElementById('integrationsEmail').value.trim();
+  const err = document.getElementById('integrationsErr');
+  err.textContent = '';
+  if(!email){ err.textContent = 'enter the contractor\'s email first'; return; }
+  document.getElementById('integrationsInfo').textContent = '';
+  try{
+    const data = await api('/integrations/lookup?email=' + encodeURIComponent(email));
+    const notes = [];
+    if(data.field_app?.tenantId){ document.getElementById('fieldAppTenantId').value = data.field_app.tenantId; notes.push(`Field App: found "${data.field_app.companyName}"`); }
+    else notes.push('Field App: ' + (data.field_app?.error || 'no match'));
+    if(data.lexi?.tenantId){ document.getElementById('lexiTenantId').value = data.lexi.tenantId; notes.push(`Lexi: found "${data.lexi.companyName}"`); }
+    else notes.push('Lexi: ' + (data.lexi?.error || 'no match'));
+    document.getElementById('integrationsInfo').textContent = notes.join(' · ') + ' — review, then hit Save.';
+  }catch(e){ err.textContent = e.message; }
 }
 
 async function saveIntegrations(){

@@ -766,6 +766,37 @@ app.post("/modules/deactivate", async (req, res) => {
 // Brain's scope string is arbitrary and set at onboarding - it has no
 // relationship to either live app's own tenant id. This is the one place
 // that mapping is kept, so request_quote/request_review know who to call.
+// GET /integrations/lookup?email=... - resolves a Field App / Lexi tenant id
+// from the contractor's own business email, so the admin panel doesn't
+// require Joshua to go find a UUID in each app and paste it in by hand. Pure
+// lookup - never writes scope_integrations itself, the Save button does that
+// after he's seen (and can still edit) what came back.
+app.get("/integrations/lookup", async (req, res) => {
+  const email = String(req.query.email || "").trim();
+  if (!email) return res.status(400).json({ error: "email is required" });
+
+  async function lookup(base, key) {
+    if (!base || !key) return { error: "not configured" };
+    try {
+      const r = await fetch(`${base.replace(/\/+$/, "")}/api/machine/tenant-lookup?email=${encodeURIComponent(email)}`, {
+        headers: { Authorization: `Bearer ${key}` },
+        signal: AbortSignal.timeout(10000),
+      });
+      const data = await r.json();
+      if (!r.ok) return { error: data?.error || `HTTP ${r.status}` };
+      return data;
+    } catch (e) {
+      return { error: "could not reach the app: " + e.message };
+    }
+  }
+
+  const [fieldApp, lexi] = await Promise.all([
+    lookup(process.env.FIELD_APP_BASE_URL, process.env.FIELD_APP_MACHINE_KEY),
+    lookup(process.env.LEXI_BASE_URL, process.env.LEXI_MACHINE_KEY),
+  ]);
+  res.json({ field_app: fieldApp, lexi });
+});
+
 app.get("/integrations/status", async (req, res) => {
   const scope = getScope(req);
   if (!scope) return res.status(400).json({ error: "valid scope required" });
