@@ -517,6 +517,56 @@ const TOOL_LIBRARY = {
       }
     },
   },
+  request_ai_clone_video: {
+    description: "Kick off a talking-head AI video on a topic (uses the business owner's own cloned voice/face). Fire-and-forget - it renders in the background, the office checks their own Clone tab for the finished video. Never tell the customer a video is ready yet. Args: topic (what the video should be about), extra_context (optional, more detail for the script).",
+    keywords: ["ai video", "clone video", "talking head", "make a video", "record a video"],
+    async run({ scope, topic, extra_context }) {
+      if (!topic) return { result: "needs_more_info", message: "Need a topic for the video." };
+      const base = process.env.LEXI_BASE_URL, key = process.env.LEXI_MACHINE_KEY;
+      if (!base || !key) return { result: "error", message: "AI Clone isn't wired up for this business yet." };
+      const { rows } = await pool.query("SELECT lexi_tenant_id FROM scope_integrations WHERE scope=$1", [scope]);
+      const tenantId = rows[0]?.lexi_tenant_id;
+      if (!tenantId) return { result: "error", message: "This business hasn't linked its Lexi account yet - someone from the team will follow up." };
+      try {
+        const r = await fetch(`${base.replace(/\/+$/, "")}/api/machine/clone/publish`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+          body: JSON.stringify({ tenantId, topic, extraContext: extra_context }),
+          signal: AbortSignal.timeout(30000),
+        });
+        const data = await r.json();
+        if (!r.ok) return { result: "error", message: data?.error || "Clone pipeline rejected the request." };
+        return { result: "started", message: "Video is rendering - check the Clone tab shortly.", talkId: data.didTalkId };
+      } catch (e) {
+        return { result: "error", message: "Could not reach the AI Clone system: " + e.message };
+      }
+    },
+  },
+  create_marketing_draft: {
+    description: "Create a draft social media post/video in the Marketing tab for the office to review and finish. This does NOT generate, render, or publish anything - it only queues a draft. Never tell the customer anything got posted. Args: topic (what the post should be about), platforms (optional array like facebook, instagram).",
+    keywords: ["marketing", "social media post", "content draft", "promote", "post about"],
+    async run({ scope, topic, platforms }) {
+      if (!topic) return { result: "needs_more_info", message: "Need a topic for the draft." };
+      const base = process.env.LEXI_BASE_URL, key = process.env.LEXI_MACHINE_KEY;
+      if (!base || !key) return { result: "error", message: "Marketing drafts aren't wired up for this business yet." };
+      const { rows } = await pool.query("SELECT lexi_tenant_id FROM scope_integrations WHERE scope=$1", [scope]);
+      const tenantId = rows[0]?.lexi_tenant_id;
+      if (!tenantId) return { result: "error", message: "This business hasn't linked its Lexi account yet - someone from the team will follow up." };
+      try {
+        const r = await fetch(`${base.replace(/\/+$/, "")}/api/machine/marketing/draft`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+          body: JSON.stringify({ tenantId, topic, platforms: Array.isArray(platforms) ? platforms : undefined }),
+          signal: AbortSignal.timeout(15000),
+        });
+        const data = await r.json();
+        if (!r.ok) return { result: "error", message: data?.error || "Marketing draft rejected." };
+        return { result: "drafted", message: "Draft queued in the Marketing tab for the office to finish.", draftId: data.id };
+      } catch (e) {
+        return { result: "error", message: "Could not reach the marketing system: " + e.message };
+      }
+    },
+  },
   create_lead: { description: "Create a new lead/contact in the CRM.", keywords: ["lead", "new customer", "contact", "crm"], async run() { return { stub: true, note: "not wired to a real CRM yet" }; } },
   update_lead: { description: "Update an existing lead/contact in the CRM.", keywords: ["update", "lead", "contact", "crm", "note"], async run() { return { stub: true, note: "not wired to a real CRM yet" }; } },
   notify_owner: { description: "Notify the business owner directly about something urgent.", keywords: ["notify", "alert", "owner", "urgent", "tell them"], async run() { return { stub: true, note: "not wired to a real notification channel yet" }; } },
