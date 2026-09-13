@@ -480,6 +480,13 @@ app.post("/modules/deactivate", async (req, res) => {
   res.json({ ok: true, activation: rows[0] || { scope, module, status: "inactive", note: "was never activated" } });
 });
 
+// Every contractor scope that has ever activated a module - the admin panel's
+// "customer list." Without this there is no way to discover contractors at all.
+app.get("/admin/scopes", async (req, res) => {
+  const { rows } = await pool.query("SELECT DISTINCT scope FROM module_activations ORDER BY scope");
+  res.json({ scopes: rows.map(r => r.scope) });
+});
+
 app.get("/modules/status", async (req, res) => {
   const scope = getScope(req);
   if (!scope) return res.status(400).json({ error: "valid scope required" });
