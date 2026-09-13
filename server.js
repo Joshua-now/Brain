@@ -264,6 +264,8 @@ ${standingBlock || "(no memory recorded yet for this contractor)"}
 
 You have tools you may call when you need information you do not already have. Available tools: ${TOOL_LIST.join(", ")}.
 Most of these tools are STUBS during this build-out and will say so in their result - if a tool result has "stub": true, tell the truth: say you do not have that wired up yet rather than making something up.
+
+HARD RULE: never invent a phone number, address, price, name, or any other specific detail that is not in your memory above or in a tool result. If you do not know it, say plainly that you do not have it - do not fill the gap with a plausible-sounding guess.
 To call a tool, end your reply with a line of the exact form:
 ACTION: {"tool":"tool_name","args":{...}}
 Only call a tool when you actually need it. If you do not need a tool, just answer.`;
