@@ -270,6 +270,15 @@ To call a tool, end your reply with a line of the exact form:
 ACTION: {"tool":"tool_name","args":{...}}
 Only call a tool when you actually need it. If you do not need a tool, just answer.`;
 
+// A hard, code-level backstop: no model can be fully talked out of inventing a
+// phone number via prompt alone (555-xxxx is the universal fake-number reflex
+// across every model tested). Strip any phone-shaped string the model outputs
+// unless it is verbatim in the contractor's own standing memory.
+const PHONE_RE = /(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g;
+function stripUnverifiedPhoneNumbers(text, standingBlock) {
+  return String(text).replace(PHONE_RE, (m) => (standingBlock && standingBlock.includes(m)) ? m : "[no verified callback number on file]");
+}
+
 function parseAction(raw) {
   const idx = raw.indexOf("ACTION:");
   if (idx === -1) return { text: raw.trim(), action: null };
@@ -326,6 +335,7 @@ app.post("/v1/brain/respond", async (req, res) => {
 
     let raw = await callModel(messages);
     let { text, action } = parseAction(raw);
+    text = stripUnverifiedPhoneNumbers(text, standingBlock);
     let toolResult = null;
 
     if (action && TOOLS[action.tool]) {
@@ -333,7 +343,7 @@ app.post("/v1/brain/respond", async (req, res) => {
       messages.push({ role: "assistant", content: raw });
       messages.push({ role: "user", content: `TOOL RESULT for ${action.tool}: ${JSON.stringify(toolResult)}\n\nNow give the final answer, plain text, no ACTION line.` });
       raw = await callModel(messages);
-      text = raw.trim();
+      text = stripUnverifiedPhoneNumbers(raw.trim(), standingBlock);
     } else if (action) {
       toolResult = { error: `unknown tool "${action.tool}"` };
     }
