@@ -118,7 +118,7 @@ app.get(["/admin", "/admin/"], (req, res) => {
 
 // ── Auth + scope guards ──────────────────────────────────────────────────────
 app.use((req, res, next) => {
-  if (req.path === "/health") return next();
+  if (req.path === "/health" || req.path === "/monitor/status") return next();
   const tok = (req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
   if (!API_KEY || tok !== API_KEY) return res.status(401).json({ error: "unauthorized" });
   next();
@@ -128,7 +128,52 @@ function getScope(req) {
   return /^[a-zA-Z0-9:_\-]{1,120}$/.test(s) ? s : "";
 }
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "brain", autoReflect: AUTO_REFLECT }));
+app.get("/health", async (_req, res) => {
+  try {
+    await pool.query("SELECT 1");
+    res.json({ ok: true, service: "brain", autoReflect: AUTO_REFLECT, db: "up" });
+  } catch (e) {
+    res.status(503).json({ ok: false, service: "brain", db: "down", error: e.message });
+  }
+});
+
+// ── MONITORING: one endpoint an external check can poll to know if anything
+// actually needs a human. Silent (problems: []) when nothing does - this is
+// meant to be read by a scheduled check, not a person, most of the time.
+app.get("/monitor/status", async (_req, res) => {
+  const problems = [];
+  let dbOk = true;
+  try {
+    await pool.query("SELECT 1");
+  } catch (e) {
+    dbOk = false;
+    problems.push(`database unreachable: ${e.message}`);
+  }
+  let errorCount = 0, negativeMargins = [];
+  if (dbOk) {
+    try {
+      const { rows: errRows } = await pool.query(
+        "SELECT COUNT(*) AS n FROM usage_events WHERE event_type='error' AND created_at > now() - interval '1 hour'");
+      errorCount = Number(errRows[0].n);
+      if (errorCount > 0) problems.push(`${errorCount} logged error event(s) in the last hour`);
+    } catch (e) { problems.push(`could not check recent errors: ${e.message}`); }
+    try {
+      const month = new Date().toISOString().slice(0, 7);
+      const { rows: marginRows } = await pool.query(
+        `SELECT scope, module, COALESCE(SUM(cost_usd),0) AS cost_usd
+         FROM usage_events WHERE event_type='ai_call' AND to_char(created_at,'YYYY-MM')=$1
+         GROUP BY scope, module`, [month]);
+      for (const r of marginRows) {
+        const price = MODULE_PRICE_USD[r.module];
+        if (price != null && Number(r.cost_usd) > price) {
+          negativeMargins.push({ scope: r.scope, module: r.module, cost_usd: Number(r.cost_usd), price_usd: price });
+        }
+      }
+      if (negativeMargins.length) problems.push(`${negativeMargins.length} scope(s) running negative margin this month`);
+    } catch (e) { problems.push(`could not check margins: ${e.message}`); }
+  }
+  res.json({ ok: problems.length === 0, db: dbOk ? "up" : "down", error_count_1h: errorCount, negative_margin_count: negativeMargins.length, problems });
+});
 
 // ── OBSERVER: log a raw interaction (+ optional outcome signal) ──────────────
 app.post("/write", async (req, res) => {
