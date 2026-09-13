@@ -498,7 +498,7 @@ function parseAction(raw) {
   return { text, action: null };
 }
 
-async function callModel(messages) {
+async function callModelOnce(messages) {
   const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`, "Content-Type": "application/json" },
@@ -511,6 +511,22 @@ async function callModel(messages) {
     content: d?.choices?.[0]?.message?.content || "",
     tokensIn: d?.usage?.prompt_tokens ?? null,
     tokensOut: d?.usage?.completion_tokens ?? null,
+  };
+}
+
+// The model sometimes comes back with whitespace-only content (seen live,
+// roughly half the time on one test scope) - a real string, not an error,
+// that just trims to nothing. Retry once before accepting that as the
+// answer; tokens from both attempts count toward real cost either way.
+async function callModel(messages) {
+  const first = await callModelOnce(messages);
+  if (first.content && first.content.trim()) return first;
+  console.error("[brain] model returned blank/whitespace content, retrying once");
+  const second = await callModelOnce(messages);
+  return {
+    content: second.content,
+    tokensIn: (first.tokensIn || 0) + (second.tokensIn || 0),
+    tokensOut: (first.tokensOut || 0) + (second.tokensOut || 0),
   };
 }
 
@@ -564,7 +580,7 @@ app.post("/v1/brain/respond", async (req, res) => {
     for (let step = 0; step < MAX_STEPS; step++) {
       const call = await callModel(messages);
       totalTokensIn += call.tokensIn || 0; totalTokensOut += call.tokensOut || 0;
-      if (!call.content) console.error(`[brain] EMPTY model content at step ${step}, scope=${scope}, messages=${messages.length}`);
+      if (!call.content || !call.content.trim()) console.error(`[brain] still-blank model content at step ${step} after retry, scope=${scope}, messages=${messages.length}`);
       const { text, action } = parseAction(call.content);
 
       if (!action) { finalText = text; break; }
