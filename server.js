@@ -583,7 +583,18 @@ app.post("/v1/brain/respond", async (req, res) => {
       if (!call.content || !call.content.trim()) console.error(`[brain] still-blank model content at step ${step} after all retries, scope=${scope}, messages=${messages.length}`);
       const { text, action } = parseAction(call.content);
 
-      if (!action) { finalText = text; break; }
+      if (!action) {
+        if (text && text.trim()) { finalText = text; break; }
+        // Real root cause of the leftover blank-response cases (confirmed via
+        // logs - the earlier blank/whitespace retries never fired for these):
+        // content came back non-blank but was just a malformed/truncated
+        // ACTION line with no usable text before it. Don't silently accept ""
+        // as the final answer - nudge and let the model try again.
+        console.error(`[brain] step ${step} had no usable text and no parseable action, scope=${scope}, raw="${String(call.content).slice(0, 200)}"`);
+        messages.push({ role: "assistant", content: call.content });
+        messages.push({ role: "user", content: "That didn't come through as a usable answer or a valid tool call - it looked like a broken or incomplete ACTION line. Give a plain-text answer now, or a properly formatted ACTION line if you truly need one more tool." });
+        continue;
+      }
 
       messages.push({ role: "assistant", content: call.content });
 
