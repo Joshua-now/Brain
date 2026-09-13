@@ -69,6 +69,26 @@ async function initDb() {
       updated_at TIMESTAMPTZ DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS idx_mem_scope ON memories(scope);
+    CREATE TABLE IF NOT EXISTS module_activations (
+      scope TEXT NOT NULL,
+      module TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'inactive',   -- 'active' | 'inactive'
+      activated_at TIMESTAMPTZ,
+      deactivated_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ DEFAULT now(),
+      PRIMARY KEY (scope, module)
+    );
+    CREATE TABLE IF NOT EXISTS usage_events (
+      id BIGSERIAL PRIMARY KEY,
+      scope TEXT NOT NULL,
+      module TEXT NOT NULL,
+      event_type TEXT NOT NULL,        -- 'invoked' | 'success' | 'error'
+      detail TEXT,
+      duration_ms INTEGER,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_usage_scope_module ON usage_events(scope, module, created_at);
+
   `);
 }
 
@@ -365,6 +385,102 @@ app.post("/v1/brain/respond", async (req, res) => {
   } catch (e) {
     res.status(502).json({ error: "brain respond failed: " + e.message, response: null, action: null, handoff: true });
   }
+});
+
+
+// ── MODULE ACTIVATION: the contractor-facing on/off switch ───────────────────
+// A contractor turns a module on when they need it. That single action starts
+// the billing clock (see /usage/status below) - nothing else has to happen
+// for it to "just work" from their side.
+app.post("/modules/activate", async (req, res) => {
+  const scope = getScope(req);
+  if (!scope) return res.status(400).json({ error: "valid scope required" });
+  const module = String(req.body?.module || "").trim();
+  if (!module) return res.status(400).json({ error: "module required" });
+  const { rows } = await pool.query(
+    `INSERT INTO module_activations (scope, module, status, activated_at, updated_at)
+     VALUES ($1,$2,'active',now(),now())
+     ON CONFLICT (scope, module) DO UPDATE SET
+       status = 'active',
+       activated_at = CASE WHEN module_activations.status = 'active' THEN module_activations.activated_at ELSE now() END,
+       deactivated_at = NULL,
+       updated_at = now()
+     RETURNING scope, module, status, activated_at`,
+    [scope, module]);
+  await pool.query("INSERT INTO usage_events(scope, module, event_type, detail) VALUES ($1,$2,'invoked','activated')", [scope, module]);
+  res.json({ ok: true, activation: rows[0] });
+});
+
+app.post("/modules/deactivate", async (req, res) => {
+  const scope = getScope(req);
+  if (!scope) return res.status(400).json({ error: "valid scope required" });
+  const module = String(req.body?.module || "").trim();
+  if (!module) return res.status(400).json({ error: "module required" });
+  const { rows } = await pool.query(
+    `UPDATE module_activations SET status='inactive', deactivated_at=now(), updated_at=now()
+     WHERE scope=$1 AND module=$2 RETURNING scope, module, status, deactivated_at`,
+    [scope, module]);
+  res.json({ ok: true, activation: rows[0] || { scope, module, status: "inactive", note: "was never activated" } });
+});
+
+app.get("/modules/status", async (req, res) => {
+  const scope = getScope(req);
+  if (!scope) return res.status(400).json({ error: "valid scope required" });
+  const { rows } = await pool.query(
+    "SELECT module, status, activated_at, deactivated_at FROM module_activations WHERE scope=$1 ORDER BY module", [scope]);
+  res.json({ modules: rows });
+});
+
+// ── USAGE: the raw activity log any module logs real work against ────────────
+// Optional `created_at` lets ops/tests backfill a timestamp; real callers omit it.
+app.post("/usage/log", async (req, res) => {
+  const scope = getScope(req);
+  if (!scope) return res.status(400).json({ error: "valid scope required" });
+  const { module = "", event_type = "", detail = null, duration_ms = null, created_at = null } = req.body || {};
+  if (!module || !["invoked", "success", "error"].includes(event_type)) {
+    return res.status(400).json({ error: "module and a valid event_type (invoked|success|error) required" });
+  }
+  await pool.query(
+    "INSERT INTO usage_events(scope, module, event_type, detail, duration_ms, created_at) VALUES ($1,$2,$3,$4,$5, COALESCE($6, now()))",
+    [scope, module, event_type, detail ? String(detail).slice(0, 2000) : null, duration_ms, created_at]);
+  res.json({ ok: true });
+});
+
+// ── BILLING TRIGGER: Rule 2 - bill starts on first real success, or 14 days
+//    after activation, whichever comes first. This is the one place that rule
+//    is implemented; the dollar amount on top of it is a separate decision.
+app.get("/usage/status", async (req, res) => {
+  const scope = getScope(req);
+  if (!scope) return res.status(400).json({ error: "valid scope required" });
+  const module = String(req.query.module || "").trim();
+  if (!module) return res.status(400).json({ error: "module required" });
+
+  const act = await pool.query("SELECT status, activated_at FROM module_activations WHERE scope=$1 AND module=$2", [scope, module]);
+  if (!act.rowCount || !act.rows[0].activated_at) {
+    return res.json({ module, active: false, billable: false, reason: "never activated" });
+  }
+  const { status, activated_at } = act.rows[0];
+
+  const firstSuccess = await pool.query(
+    "SELECT MIN(created_at) AS t FROM usage_events WHERE scope=$1 AND module=$2 AND event_type='success'", [scope, module]);
+  const firstSuccessAt = firstSuccess.rows[0]?.t || null;
+
+  const fourteenDaysMs = 14 * 24 * 3600 * 1000;
+  const activatedMs = new Date(activated_at).getTime();
+  const graceExpiresAt = new Date(activatedMs + fourteenDaysMs);
+  const now = new Date();
+
+  let billable = false, billingStartedAt = null, reason = "grace period - no success yet, 14 days not elapsed";
+  if (firstSuccessAt) {
+    billable = true; billingStartedAt = firstSuccessAt; reason = "first real success recorded";
+  } else if (now >= graceExpiresAt) {
+    billable = true; billingStartedAt = graceExpiresAt.toISOString(); reason = "14-day grace period elapsed with no success yet";
+  }
+
+  res.json({
+    module, active: status === "active", activated_at, first_success_at: firstSuccessAt,
+    grace_expires_at: graceExpiresAt.toISOString(), billable, billing_started_at: billingStartedAt, reason,
+  });
 });
 
 const PORT = process.env.PORT || 8080;
