@@ -88,6 +88,9 @@ async function initDb() {
       created_at TIMESTAMPTZ DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS idx_usage_scope_module ON usage_events(scope, module, created_at);
+    ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tokens_in INTEGER;
+    ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tokens_out INTEGER;
+    ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cost_usd NUMERIC(12,6);
 
   `);
 }
@@ -287,6 +290,26 @@ const TOOLS = {
 const TOOL_LIST = Object.keys(TOOLS);
 const RESPOND_MODEL = process.env.RESPOND_MODEL || REFLECT_MODEL;
 
+// $ per token (not per million - keeps callCost() simple). Source: OpenRouter's
+// own listed price for openai/gpt-oss-120b, checked 2026-09-13. This is a manual
+// map - update it if RESPOND_MODEL ever changes to a different model.
+const MODEL_RATES_PER_TOKEN = {
+  "openai/gpt-oss-120b": { in: 0.03 / 1_000_000, out: 0.17 / 1_000_000 },
+};
+function callCost(model, tokensIn, tokensOut) {
+  const rate = MODEL_RATES_PER_TOKEN[model];
+  if (!rate) return null; // unknown model - don't pretend we know the cost
+  return (tokensIn || 0) * rate.in + (tokensOut || 0) * rate.out;
+}
+
+// Flat monthly price per module, CONTRACTOR-facing (Variant A pricing).
+// This is what the contractor is charged - separate from what it costs us.
+const MODULE_PRICE_USD = {
+  speed_to_lead: 250,
+  lexi: 300,
+  field_app: 180,
+};
+
 const RESPOND_SYS = (standingBlock) => `You are the Contractor Brain for one specific contractor. Answer the incoming message directly and briefly, the way a sharp office manager would.
 You have this business's known memory below - treat it as ground truth, do not contradict it:
 ${standingBlock || "(no memory recorded yet for this contractor)"}
@@ -332,13 +355,27 @@ async function callModel(messages) {
   });
   const d = await r.json();
   if (d?.error) throw new Error(typeof d.error === "string" ? d.error : JSON.stringify(d.error));
-  return d?.choices?.[0]?.message?.content || "";
+  return {
+    content: d?.choices?.[0]?.message?.content || "",
+    tokensIn: d?.usage?.prompt_tokens ?? null,
+    tokensOut: d?.usage?.completion_tokens ?? null,
+  };
+}
+
+// Logs the real $ cost of one brain call against a scope+module. This is OUR
+// internal cost tracking - the contractor never sees it. Separate on purpose
+// from the contractor-facing billing trigger in /usage/status.
+async function logAiCost(scope, module, tokensIn, tokensOut) {
+  const cost = callCost(RESPOND_MODEL, tokensIn, tokensOut);
+  await pool.query(
+    "INSERT INTO usage_events(scope, module, event_type, detail, tokens_in, tokens_out, cost_usd) VALUES ($1,$2,'ai_call',$3,$4,$5,$6)",
+    [scope, module, RESPOND_MODEL, tokensIn, tokensOut, cost]);
 }
 
 app.post("/v1/brain/respond", async (req, res) => {
   const scope = getScope(req);
   if (!scope) return res.status(400).json({ error: "valid scope required" });
-  const { message = "", conversation_id = "" } = req.body || {};
+  const { message = "", conversation_id = "", module = "unassigned" } = req.body || {};
   if (!message) return res.status(400).json({ error: "message required" });
   if (!process.env.OPENROUTER_API_KEY) {
     return res.status(503).json({ error: "no model configured - set OPENROUTER_API_KEY", response: null, action: null, handoff: true });
@@ -363,7 +400,9 @@ app.post("/v1/brain/respond", async (req, res) => {
       { role: "user", content: String(message).slice(0, 4000) },
     ];
 
-    let raw = await callModel(messages);
+    let call = await callModel(messages);
+    let raw = call.content;
+    let totalTokensIn = call.tokensIn || 0, totalTokensOut = call.tokensOut || 0;
     let { text, action } = parseAction(raw);
     text = stripUnverifiedPhoneNumbers(text, standingBlock);
     let toolResult = null;
@@ -372,7 +411,9 @@ app.post("/v1/brain/respond", async (req, res) => {
       toolResult = await TOOLS[action.tool]({ scope, ...(action.args || {}) });
       messages.push({ role: "assistant", content: raw });
       messages.push({ role: "user", content: `TOOL RESULT for ${action.tool}: ${JSON.stringify(toolResult)}\n\nNow give the final answer, plain text, no ACTION line.` });
-      raw = await callModel(messages);
+      call = await callModel(messages);
+      raw = call.content;
+      totalTokensIn += call.tokensIn || 0; totalTokensOut += call.tokensOut || 0;
       text = stripUnverifiedPhoneNumbers(raw.trim(), standingBlock);
     } else if (action) {
       toolResult = { error: `unknown tool "${action.tool}"` };
@@ -380,6 +421,7 @@ app.post("/v1/brain/respond", async (req, res) => {
 
     await pool.query("INSERT INTO trajectories(scope, session_id, role, content) VALUES ($1,$2,'assistant',$3)",
       [scope, String(conversation_id).slice(0, 200), text.slice(0, 20000)]);
+    await logAiCost(scope, String(module).trim() || "unassigned", totalTokensIn, totalTokensOut);
 
     res.json({ response: text, action: action ? action.tool : null, tool_result: toolResult, handoff: false });
   } catch (e) {
@@ -482,6 +524,63 @@ app.get("/usage/status", async (req, res) => {
     module, active: status === "active", activated_at, first_success_at: firstSuccessAt,
     grace_expires_at: graceExpiresAt.toISOString(), billable, billing_started_at: billingStartedAt, reason,
   });
+});
+
+// ── MARGIN: what we actually charge vs. what it actually costs us ────────────
+// Contractor never sees this. Real AI $ cost (from ai_call events, logged by
+// logAiCost) against the flat module price, per scope, per month. This is
+// TOKEN COST ONLY - it does not yet include Railway compute or (once this is
+// wired to real calls) Telnyx per-minute voice cost, which will matter far
+// more than token cost once this is live on the phone.
+app.get("/margin/status", async (req, res) => {
+  const scope = getScope(req);
+  if (!scope) return res.status(400).json({ error: "valid scope required" });
+  const module = String(req.query.module || "").trim();
+  if (!module) return res.status(400).json({ error: "module required" });
+  const month = String(req.query.month || new Date().toISOString().slice(0, 7)); // "YYYY-MM"
+
+  const { rows } = await pool.query(
+    `SELECT COUNT(*) AS calls, COALESCE(SUM(tokens_in),0) AS tokens_in, COALESCE(SUM(tokens_out),0) AS tokens_out,
+            COALESCE(SUM(cost_usd),0) AS cost_usd
+     FROM usage_events
+     WHERE scope=$1 AND module=$2 AND event_type='ai_call' AND to_char(created_at, 'YYYY-MM')=$3`,
+    [scope, module, month]);
+  const r = rows[0];
+  const price = MODULE_PRICE_USD[module] ?? null;
+  const cost = Number(r.cost_usd);
+  const margin = price !== null ? price - cost : null;
+  const marginPct = price ? Math.round((margin / price) * 1000) / 10 : null;
+
+  res.json({
+    scope, module, month,
+    ai_calls: Number(r.calls), tokens_in: Number(r.tokens_in), tokens_out: Number(r.tokens_out),
+    ai_cost_usd: Math.round(cost * 1e6) / 1e6,
+    price_usd: price,
+    margin_usd: margin !== null ? Math.round(margin * 100) / 100 : null,
+    margin_pct: marginPct,
+    note: "ai_cost_usd is token cost only - does not include Railway compute or telephony/voice minutes",
+  });
+});
+
+// Bird's-eye view across every contractor for a month - flags anything worth a look.
+app.get("/margin/summary", async (req, res) => {
+  const month = String(req.query.month || new Date().toISOString().slice(0, 7));
+  const { rows } = await pool.query(
+    `SELECT scope, module, COUNT(*) AS calls, COALESCE(SUM(cost_usd),0) AS cost_usd
+     FROM usage_events
+     WHERE event_type='ai_call' AND to_char(created_at, 'YYYY-MM')=$1
+     GROUP BY scope, module ORDER BY cost_usd DESC`,
+    [month]);
+  const out = rows.map(r => {
+    const price = MODULE_PRICE_USD[r.module] ?? null;
+    const cost = Number(r.cost_usd);
+    return {
+      scope: r.scope, module: r.module, ai_calls: Number(r.calls),
+      ai_cost_usd: Math.round(cost * 1e6) / 1e6, price_usd: price,
+      margin_usd: price !== null ? Math.round((price - cost) * 100) / 100 : null,
+    };
+  });
+  res.json({ month, rows: out });
 });
 
 const PORT = process.env.PORT || 8080;
