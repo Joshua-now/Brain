@@ -769,15 +769,21 @@ app.get("/integrations/status", async (req, res) => {
 app.post("/integrations/config", async (req, res) => {
   const scope = getScope(req);
   if (!scope) return res.status(400).json({ error: "valid scope required" });
-  const fieldAppTenantId = req.body?.field_app_tenant_id != null ? String(req.body.field_app_tenant_id).trim() || null : undefined;
-  const lexiTenantId = req.body?.lexi_tenant_id != null ? String(req.body.lexi_tenant_id).trim() || null : undefined;
+  const { rows: existingRows } = await pool.query(
+    "SELECT field_app_tenant_id, lexi_tenant_id FROM scope_integrations WHERE scope=$1", [scope]);
+  const existing = existingRows[0] || { field_app_tenant_id: null, lexi_tenant_id: null };
+  // A field present in the body (even as "") is a real instruction - write it
+  // exactly, including clearing it. A field absent from the body is left
+  // untouched. This is a real read-then-write, not COALESCE guessing intent.
+  const fieldAppTenantId = "field_app_tenant_id" in (req.body || {})
+    ? (String(req.body.field_app_tenant_id ?? "").trim() || null) : existing.field_app_tenant_id;
+  const lexiTenantId = "lexi_tenant_id" in (req.body || {})
+    ? (String(req.body.lexi_tenant_id ?? "").trim() || null) : existing.lexi_tenant_id;
   const { rows } = await pool.query(
     `INSERT INTO scope_integrations (scope, field_app_tenant_id, lexi_tenant_id, updated_at)
      VALUES ($1, $2, $3, now())
      ON CONFLICT (scope) DO UPDATE SET
-       field_app_tenant_id = COALESCE($2, scope_integrations.field_app_tenant_id),
-       lexi_tenant_id = COALESCE($3, scope_integrations.lexi_tenant_id),
-       updated_at = now()
+       field_app_tenant_id = $2, lexi_tenant_id = $3, updated_at = now()
      RETURNING field_app_tenant_id, lexi_tenant_id, updated_at`,
     [scope, fieldAppTenantId, lexiTenantId]);
   res.json({ ok: true, config: rows[0] });
