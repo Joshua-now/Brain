@@ -339,8 +339,36 @@ const TOOL_LIBRARY = {
     },
   },
   check_service_area: { description: "Check whether a location/zip is inside this business's service area.", keywords: ["area", "zip", "location", "travel", "far"], async run() { return { stub: true, note: "not wired to real service-area data yet" }; } },
-  check_calendar: { description: "Check real-time appointment availability.", keywords: ["calendar", "availability", "schedule", "appointment", "when", "book"], async run() { return { stub: true, note: "not wired to a real calendar yet" }; } },
-  book_appointment: { description: "Book a real appointment on the calendar.", keywords: ["book", "schedule", "appointment", "reserve"], async run() { return { stub: true, note: "not wired to a real calendar yet" }; } },
+  check_calendar: {
+    description: "There is no separate availability check. Call book_appointment directly with the date/time the customer wants - it will tell you if that slot doesn't work.",
+    keywords: ["calendar", "availability", "schedule", "appointment", "when", "book"],
+    async run() { return { stub: true, note: "no separate availability check exists - call book_appointment with the requested date/time instead" }; },
+  },
+  book_appointment: {
+    description: "Book a real appointment on the calendar. Args: lead_name, lead_phone, appointment_date, appointment_time (natural language is fine - 'tomorrow', '9am', '2:30pm'), optionally lead_email, notes.",
+    keywords: ["book", "schedule", "appointment", "reserve", "calendar"],
+    async run({ scope, module, lead_name, lead_phone, appointment_date, appointment_time, lead_email, notes }) {
+      if (!lead_name || !lead_phone || !appointment_date || !appointment_time) {
+        return { result: "needs_more_info", message: "Need the customer's name, phone number, and a day + time before this can be booked." };
+      }
+      try {
+        const r = await fetch("https://n8n-production-5955.up.railway.app/webhook/booking-guard", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ lead_name, lead_phone, appointment_date, appointment_time, lead_email, notes, business_name: scope }),
+          signal: AbortSignal.timeout(15000),
+        });
+        const data = await r.json();
+        if (data?.result === "booked") {
+          await pool.query("INSERT INTO usage_events(scope, module, event_type, detail) VALUES ($1,$2,'success','booked_appointment')",
+            [scope, String(module || "unassigned")]);
+        }
+        return data || { result: "error", message: "booking service returned no data" };
+      } catch (e) {
+        return { result: "error", message: "Could not reach the booking system: " + e.message };
+      }
+    },
+  },
   create_lead: { description: "Create a new lead/contact in the CRM.", keywords: ["lead", "new customer", "contact", "crm"], async run() { return { stub: true, note: "not wired to a real CRM yet" }; } },
   update_lead: { description: "Update an existing lead/contact in the CRM.", keywords: ["update", "lead", "contact", "crm", "note"], async run() { return { stub: true, note: "not wired to a real CRM yet" }; } },
   notify_owner: { description: "Notify the business owner directly about something urgent.", keywords: ["notify", "alert", "owner", "urgent", "tell them"], async run() { return { stub: true, note: "not wired to a real notification channel yet" }; } },
@@ -493,7 +521,7 @@ app.post("/v1/brain/respond", async (req, res) => {
       }
 
       if (unlocked.has(action.tool) && TOOL_LIBRARY[action.tool]) {
-        const result = await TOOL_LIBRARY[action.tool].run({ scope, ...(action.args || {}) });
+        const result = await TOOL_LIBRARY[action.tool].run({ scope, module, ...(action.args || {}) });
         lastAction = action.tool; lastToolResult = result;
         messages.push({ role: "user", content: `TOOL RESULT for ${action.tool}: ${JSON.stringify(result)}\n\nNow give the final answer, plain text, no ACTION line unless you genuinely need one more tool.` });
         continue;
