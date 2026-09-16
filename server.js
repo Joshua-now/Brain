@@ -619,10 +619,15 @@ function callCost(model, tokensIn, tokensOut) {
 
 // Flat monthly price per module, CONTRACTOR-facing (Variant A pricing).
 // This is what the contractor is charged - separate from what it costs us.
+// Real live prices from aiteammate.io/pricing (re-checked 16 Sep 2026).
+// after_hours was missing entirely before this fix - that product had zero
+// representation in billing/margin math even though it's sold and live.
+// The other three were stale placeholders, not the real prices.
 const MODULE_PRICE_USD = {
-  speed_to_lead: 250,
-  lexi: 300,
-  field_app: 180,
+  after_hours: 397,
+  speed_to_lead: 497,
+  field_app: 249,
+  lexi: 397,
 };
 
 function toolBlock(names) {

@@ -154,6 +154,21 @@ tbody tr:last-child td{border-bottom:none;}
 .empty{color:hsl(var(--muted-foreground)); font-size:.86rem; padding:20px 4px; text-align:center;}
 .note{color:hsl(var(--muted-foreground)); font-size:.78rem; margin-top:10px; line-height:1.5;}
 .err{color:hsl(var(--destructive)); font-size:.82rem; margin-top:8px;}
+.modgrid{display:grid; gap:12px; grid-template-columns:repeat(2,1fr); margin-top:10px;}
+@media (max-width:700px){.modgrid{grid-template-columns:1fr;}}
+.modcard{border:1px solid hsl(var(--border) / .7); border-radius:10px; padding:14px 16px; background:hsl(var(--background));}
+.modcard-head{display:flex; align-items:flex-start; justify-content:space-between; gap:10px;}
+.modcard h4{font-size:.92rem; font-weight:600; margin:0;}
+.modcard .price{font-size:.76rem; color:hsl(var(--muted-foreground)); margin-top:2px;}
+.modcard .modstats{margin-top:10px; display:flex; flex-wrap:wrap; gap:6px; align-items:center; font-size:.8rem;}
+.modcard .modmargin{margin-top:6px; font-size:.8rem; color:hsl(var(--muted-foreground));}
+.switch{position:relative; display:inline-block; width:40px; height:22px; flex:none;}
+.switch input{opacity:0; width:0; height:0; position:absolute;}
+.switch .slider{position:absolute; inset:0; background:hsl(var(--muted)); border-radius:22px; cursor:pointer; transition:.15s;}
+.switch .slider:before{content:"";position:absolute; height:16px; width:16px; left:3px; top:3px; background:#fff; border-radius:50%; transition:.15s; box-shadow:0 1px 2px rgba(0,0,0,.25);}
+.switch input:checked + .slider{background:hsl(var(--good));}
+.switch input:checked + .slider:before{transform:translateX(18px);}
+.switch input:disabled + .slider{opacity:.5; cursor:default;}
 pre{
   background:hsl(var(--muted) / .5); border:1px solid hsl(var(--border)); border-radius:8px; padding:12px;
   font-size:.78rem; white-space:pre-wrap; word-break:break-word; max-height:280px; overflow:auto; font-family:ui-monospace,monospace;
@@ -255,17 +270,6 @@ hr.sep{border:none; border-top:1px solid hsl(var(--border)); margin:16px 0;}
           </div>
 
           <div id="scopeModules"></div>
-
-          <hr class="sep">
-          <div class="row">
-            <div class="field" style="flex:1 1 200px;">
-              <label>Module name to activate</label>
-              <input type="text" id="newModule" placeholder="speed_to_lead / lexi / field_app">
-            </div>
-            <div class="field" style="flex:0 0 auto;">
-              <button onclick="activateModule()">Activate for this scope</button>
-            </div>
-          </div>
           <div id="scopeErr" class="err"></div>
 
           <hr class="sep">
@@ -500,6 +504,17 @@ async function saveIntegrations(){
   }catch(e){ err.textContent = e.message; }
 }
 
+// The four real, priced AI Teammate products (see aiteammate.io/pricing,
+// re-checked 16 Sep 2026). Keys must match MODULE_PRICE_USD in server.js
+// exactly - this fixed list is what replaces the old free-text "type the
+// internal module name from memory" box with actual toggles.
+const PRODUCTS = [
+  {key:'after_hours',   name:'After-Hours Reception',             price:397},
+  {key:'speed_to_lead', name:'Speed-to-Lead Domination',          price:497},
+  {key:'field_app',     name:'Field App / Office Assistant',      price:249},
+  {key:'lexi',          name:'Lexi — Office Manager & Marketing', price:397},
+];
+
 async function loadScope(){
   const scope = document.getElementById('scopeInput').value.trim();
   const box = document.getElementById('scopeModules');
@@ -510,48 +525,67 @@ async function loadScope(){
   loadMemories(scope);
   try{
     const data = await api('/modules/status?scope=' + encodeURIComponent(scope));
-    if(!data.modules || !data.modules.length){ box.innerHTML = '<div class="empty">No modules activated for this scope yet.</div>'; return; }
-    const rows = await Promise.all(data.modules.map(async m => {
-      let margin = null;
-      try{ margin = await api(`/margin/status?scope=${encodeURIComponent(scope)}&module=${encodeURIComponent(m.module)}`); }catch(e){}
-      let usage = null;
-      try{ usage = await api(`/usage/status?scope=${encodeURIComponent(scope)}&module=${encodeURIComponent(m.module)}`); }catch(e){}
-      return {m, margin, usage};
+    const known = data.modules || [];
+    const byModule = {};
+    known.forEach(m => { byModule[m.module] = m; });
+
+    const extra = known.filter(m => !PRODUCTS.some(p => p.key === m.module));
+
+    const cards = await Promise.all(PRODUCTS.map(async p => {
+      const m = byModule[p.key] || {module: p.key, status: 'inactive'};
+      let margin = null, usage = null;
+      try{ margin = await api(`/margin/status?scope=${encodeURIComponent(scope)}&module=${encodeURIComponent(p.key)}`); }catch(e){}
+      try{ usage = await api(`/usage/status?scope=${encodeURIComponent(scope)}&module=${encodeURIComponent(p.key)}`); }catch(e){}
+      return {p, m, margin, usage};
     }));
-    box.innerHTML = `<div class="tablewrap" style="margin-top:14px;"><table>
-      <thead><tr><th>Module</th><th>Status</th><th>Billable</th><th>Margin (this month)</th><th></th></tr></thead>
-      <tbody>${rows.map(({m,margin,usage}) => `
+
+    box.innerHTML = `<div class="modgrid">${cards.map(({p,m,margin,usage}) => {
+      const active = m.status === 'active';
+      const billableBadge = !active ? ''
+        : usage ? (usage.billable ? `<span class="badge good">billable</span>` : `<span class="badge muted">grace period</span>`)
+        : '';
+      const marginLine = active && margin && margin.margin_usd!=null
+        ? `<div class="modmargin">Margin this month: ${fmtMoney(margin.margin_usd)} / ${fmtMoney(margin.price_usd)}</div>` : '';
+      return `
+        <div class="modcard">
+          <div class="modcard-head">
+            <div>
+              <h4>${escapeHtml(p.name)}</h4>
+              <div class="price">${fmtMoney(p.price)}/mo</div>
+            </div>
+            <label class="switch">
+              <input type="checkbox" ${active ? 'checked' : ''}
+                onchange="toggleModule('${escapeAttr(scope)}','${escapeAttr(p.key)}', this.checked)">
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="modstats">
+            <span class="badge ${active ? 'good' : 'muted'}">${active ? 'on' : 'off'}</span>
+            ${billableBadge}
+          </div>
+          ${marginLine}
+        </div>`;
+    }).join('')}</div>
+    ${extra.length ? `<div class="tablewrap" style="margin-top:14px;"><table>
+      <thead><tr><th>Other module</th><th>Status</th><th></th></tr></thead>
+      <tbody>${extra.map(m => `
         <tr>
           <td>${escapeHtml(m.module)}</td>
           <td><span class="badge ${m.status==='active'?'good':'muted'}">${m.status}</span></td>
-          <td>${usage ? (usage.billable ? '<span class="badge good">billable</span> '+escapeHtml(usage.reason) : '<span class="badge muted">grace</span> '+escapeHtml(usage.reason)) : '—'}</td>
-          <td>${margin && margin.margin_usd!=null ? fmtMoney(margin.margin_usd)+' / '+fmtMoney(margin.price_usd) : '—'}</td>
           <td>${m.status==='active'
-              ? `<button class="destructive" onclick="deactivateModule('${escapeAttr(scope)}','${escapeAttr(m.module)}')">Deactivate</button>`
-              : `<button class="secondary" onclick="reactivateModule('${escapeAttr(scope)}','${escapeAttr(m.module)}')">Reactivate</button>`}</td>
+              ? `<button class="destructive" onclick="toggleModule('${escapeAttr(scope)}','${escapeAttr(m.module)}', false)">Deactivate</button>`
+              : `<button class="secondary" onclick="toggleModule('${escapeAttr(scope)}','${escapeAttr(m.module)}', true)">Reactivate</button>`}</td>
         </tr>`).join('')}</tbody>
-    </table></div>`;
+    </table></div>` : ''}`;
   }catch(e){ box.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`; }
 }
-async function activateModule(){
-  const scope = document.getElementById('scopeInput').value.trim();
-  const module = document.getElementById('newModule').value.trim();
+async function toggleModule(scope, module, turnOn){
   const err = document.getElementById('scopeErr');
   err.textContent = '';
-  if(!scope || !module){ err.textContent = 'need both a scope and a module name'; return; }
   try{
-    await api('/modules/activate', {method:'POST', body: JSON.stringify({scope, module})});
-    document.getElementById('newModule').value = '';
+    await api(turnOn ? '/modules/activate' : '/modules/deactivate', {method:'POST', body: JSON.stringify({scope, module})});
     loadScope(); loadScopeList();
-  }catch(e){ err.textContent = e.message; }
-}
-async function deactivateModule(scope, module){
-  try{ await api('/modules/deactivate', {method:'POST', body: JSON.stringify({scope, module})}); loadScope(); }
-  catch(e){ document.getElementById('scopeErr').textContent = e.message; }
-}
-async function reactivateModule(scope, module){
-  try{ await api('/modules/activate', {method:'POST', body: JSON.stringify({scope, module})}); loadScope(); }
-  catch(e){ document.getElementById('scopeErr').textContent = e.message; }
+  }catch(e){ err.textContent = e.message; loadScope(); }
 }
 async function sendTest(){
   const scope = document.getElementById('testScope').value.trim();
