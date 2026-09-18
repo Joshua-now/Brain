@@ -28,6 +28,47 @@ const { Pool } = require("pg");
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.PGSSL === "off" ? false : { rejectUnauthorized: false }, connectionTimeoutMillis: 5000 });
 const API_KEY = process.env.MEMORY_API_KEY || "";
 const REFLECT_MODEL = process.env.REFLECT_MODEL || "openai/gpt-oss-120b";
+
+// --- How we talk to OpenRouter (one place, used by every call site) --------
+// OpenRouter is a broker: the same model name is served by several different
+// providers, and it picks one per request. That choice is where inconsistent
+// latency comes from - same prompt, same model, different shop filled the
+// order. These knobs are env-tunable so routing can be changed WITHOUT a code
+// deploy:
+//   OR_PROVIDER_ORDER  - comma-separated provider slugs, LOWERCASE, in priority
+//                        order (e.g. "fireworks,together"). Slugs come from
+//                        GET /api/v1/models/{author}/{slug}/endpoints -> .tag
+//   OR_PROVIDER_SORT   - "throughput" | "latency" | "price"
+//   OR_ALLOW_FALLBACKS - "false" to fail rather than silently substitute
+// Leave all three unset and behaviour is exactly what it was before this
+// change (OpenRouter's own default routing).
+// GOTCHA from OpenRouter's docs: setting sort OR order disables their load
+// balancing. That is the trade - consistency instead of spread.
+function providerRouting() {
+  const p = {};
+  const order = String(process.env.OR_PROVIDER_ORDER || "").split(",").map(s => s.trim()).filter(Boolean);
+  if (order.length) p.order = order;
+  if (process.env.OR_PROVIDER_SORT) p.sort = process.env.OR_PROVIDER_SORT;
+  if (process.env.OR_ALLOW_FALLBACKS === "false") p.allow_fallbacks = false;
+  return Object.keys(p).length ? p : null;
+}
+
+// Attribution. Without HTTP-Referer this traffic is anonymous in the
+// OpenRouter dashboard and can't be told apart from anything else we run.
+// X-OpenRouter-Title is the CURRENT header name; X-Title is legacy.
+function orHeaders() {
+  return {
+    Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+    "Content-Type": "application/json",
+    "HTTP-Referer": process.env.OR_APP_URL || "https://brain-production-05ae.up.railway.app",
+    "X-OpenRouter-Title": process.env.OR_APP_TITLE || "Fluid Brain",
+  };
+}
+
+function orBody(fields) {
+  const provider = providerRouting();
+  return JSON.stringify(provider ? { ...fields, provider } : fields);
+}
 const AUTO_REFLECT = process.env.AUTO_REFLECT !== "off";
 const REFLECT_INTERVAL_MIN = Math.max(parseInt(process.env.REFLECT_INTERVAL_MIN) || 180, 5);
 const REFLECT_MIN_ROWS = Math.max(parseInt(process.env.REFLECT_MIN_ROWS) || 3, 1);
@@ -289,8 +330,8 @@ function looksLikeIdentifyingInfo(str) {
 async function llmReflect(text) {
   const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
-    headers: { Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: REFLECT_MODEL, temperature: 0.2, max_tokens: 1200,
+    headers: orHeaders(),
+    body: orBody({ model: REFLECT_MODEL, temperature: 0.2, max_tokens: 1200,
       messages: [{ role: "system", content: REFLECT_SYS }, { role: "user", content: "RECENT INTERACTIONS:\n\n" + text }] }),
     signal: AbortSignal.timeout(60000),
   });
@@ -663,25 +704,68 @@ function stripUnverifiedPhoneNumbers(text, standingBlock) {
   return norm.replace(PHONE_RE, (m) => (standingBlock && normText(standingBlock).includes(m)) ? m : "[no verified callback number on file]");
 }
 
+// Pull the FIRST balanced {...} out of a string, ignoring braces that sit
+// inside JSON string values and respecting backslash escapes. The old version
+// of parseAction used /\{[\s\S]*\}/, which is greedy - it ran from the first
+// brace to the LAST one anywhere in the reply. One trailing "}" in a sign-off,
+// one markdown fence, or one brace inside an argument value and the whole tool
+// call was silently lost, and the caller spoke a holding line instead. That
+// exact bug cost real bookings on the phone gateway before it was fixed there;
+// this is the same fix, ported.
+function firstBalancedObject(s) {
+  const start = s.indexOf("{");
+  if (start === -1) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (esc) { esc = false; continue; }
+    if (c === "\\") { esc = true; continue; }
+    if (c === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (c === "{") depth++;
+    else if (c === "}") { depth--; if (depth === 0) return s.slice(start, i + 1); }
+  }
+  return null; // unterminated - truncated output
+}
+
 function parseAction(raw) {
-  const idx = raw.indexOf("ACTION:");
-  if (idx === -1) return { text: raw.trim(), action: null };
-  const text = raw.slice(0, idx).trim();
-  const tail = raw.slice(idx + 7).trim();
-  const m = tail.match(/\{[\s\S]*\}/);
-  if (!m) return { text, action: null };
-  try {
-    const parsed = JSON.parse(m[0]);
-    if (parsed && typeof parsed.tool === "string") return { text, action: parsed };
-  } catch {}
+  const src = String(raw == null ? "" : raw);
+  const idx = src.indexOf("ACTION:");
+  if (idx === -1) return { text: src.trim(), action: null };
+  const text = src.slice(0, idx).trim();
+  let tail = src.slice(idx + 7).trim();
+
+  // Models wrap the payload in a markdown fence often enough to matter, and
+  // "smart" quotes show up whenever the reply passed through prose formatting.
+  tail = tail.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "")
+             .replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+
+  const candidate = firstBalancedObject(tail);
+  if (!candidate) {
+    console.error(`[brain] ACTION line present but no balanced JSON object found; payload=${tail.slice(0, 300)}`);
+    return { text, action: null };
+  }
+
+  const attempts = [
+    candidate,
+    candidate.replace(/,\s*([}\]])/g, "$1"),           // trailing comma before } or ]
+    candidate.replace(/'/g, '"').replace(/,\s*([}\]])/g, "$1"), // single-quoted keys/values
+  ];
+  for (const a of attempts) {
+    try {
+      const parsed = JSON.parse(a);
+      if (parsed && typeof parsed.tool === "string") return { text, action: parsed };
+    } catch {}
+  }
+  console.error(`[brain] ACTION payload would not parse after repairs; payload=${candidate.slice(0, 300)}`);
   return { text, action: null };
 }
 
 async function callModelOnce(messages) {
   const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
-    headers: { Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: RESPOND_MODEL, temperature: 0.3, max_tokens: 500, messages }),
+    headers: orHeaders(),
+    body: orBody({ model: RESPOND_MODEL, temperature: 0.3, max_tokens: 500, messages }),
     signal: AbortSignal.timeout(30000),
   });
   const d = await r.json();
@@ -690,6 +774,13 @@ async function callModelOnce(messages) {
     content: d?.choices?.[0]?.message?.content || "",
     tokensIn: d?.usage?.prompt_tokens ?? null,
     tokensOut: d?.usage?.completion_tokens ?? null,
+    // The amount OpenRouter actually charged us for THIS call. They return it
+    // on every response now (the old usage:{include:true} flag is deprecated
+    // and does nothing). This is the real number - it beats multiplying tokens
+    // by a hand-maintained rate table, and it stays correct for whatever model
+    // RESPOND_MODEL is swapped to. Null if OpenRouter didn't send it.
+    costUsd: typeof d?.usage?.cost === "number" ? d.usage.cost : null,
+    providerName: d?.provider || null, // which provider actually served it
   };
 }
 
@@ -698,22 +789,31 @@ async function callModelOnce(messages) {
 // that just trims to nothing. Retry once before accepting that as the
 // answer; tokens from both attempts count toward real cost either way.
 async function callModel(messages, label) {
-  let tokensIn = 0, tokensOut = 0;
+  let tokensIn = 0, tokensOut = 0, costUsd = null;
   const MAX_ATTEMPTS = 3;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const r = await callModelOnce(messages);
     tokensIn += r.tokensIn || 0; tokensOut += r.tokensOut || 0;
-    if (r.content && r.content.trim()) return { content: r.content, tokensIn, tokensOut };
-    console.error(`[brain] model returned blank/whitespace content on attempt ${attempt}/${MAX_ATTEMPTS}${label ? " (" + label + ")" : ""}`);
+    // A discarded blank attempt still costs money, so every attempt's real
+    // cost is added, not just the one that produced the answer.
+    if (typeof r.costUsd === "number") costUsd = (costUsd || 0) + r.costUsd;
+    if (r.content && r.content.trim()) return { content: r.content, tokensIn, tokensOut, costUsd };
+    console.error(`[brain] model returned blank/whitespace content on attempt ${attempt}/${MAX_ATTEMPTS}${label ? " (" + label + ")" : ""}${r.providerName ? " provider=" + r.providerName : ""}`);
   }
-  return { content: "", tokensIn, tokensOut };
+  return { content: "", tokensIn, tokensOut, costUsd };
 }
 
 // Logs the real $ cost of one brain call against a scope+module. This is OUR
 // internal cost tracking - the contractor never sees it. Separate on purpose
 // from the contractor-facing billing trigger in /usage/status.
-async function logAiCost(scope, module, tokensIn, tokensOut) {
-  const cost = callCost(RESPOND_MODEL, tokensIn, tokensOut);
+async function logAiCost(scope, module, tokensIn, tokensOut, realCostUsd) {
+  // Prefer the amount OpenRouter actually charged. Fall back to the local rate
+  // table only when they didn't send a cost. Before this, cost came solely from
+  // MODEL_RATES_PER_TOKEN, which has one model in it - so the moment
+  // RESPOND_MODEL was swapped (the header comment advertises it as a
+  // one-variable swap) every margin number would have gone silently null.
+  const cost = typeof realCostUsd === "number" ? realCostUsd : callCost(RESPOND_MODEL, tokensIn, tokensOut);
+  if (cost === null) console.error(`[brain] no cost for model ${RESPOND_MODEL} - OpenRouter sent none and it is not in MODEL_RATES_PER_TOKEN; margin math will be blank for scope=${scope}`);
   await pool.query(
     "INSERT INTO usage_events(scope, module, event_type, detail, tokens_in, tokens_out, cost_usd) VALUES ($1,$2,'ai_call',$3,$4,$5,$6)",
     [scope, module, RESPOND_MODEL, tokensIn, tokensOut, cost]);
@@ -760,13 +860,14 @@ app.post("/v1/brain/respond", async (req, res) => {
       { role: "user", content: String(message).slice(0, 4000) },
     ];
 
-    let totalTokensIn = 0, totalTokensOut = 0;
+    let totalTokensIn = 0, totalTokensOut = 0, totalCostUsd = null;
     let finalText = "", lastAction = null, lastToolResult = null;
     const MAX_STEPS = 4; // find_tools -> real tool -> final answer, plus one spare
 
     for (let step = 0; step < MAX_STEPS; step++) {
       const call = await callModel(messages, `loop step ${step}, scope=${scope}`);
       totalTokensIn += call.tokensIn || 0; totalTokensOut += call.tokensOut || 0;
+      if (typeof call.costUsd === "number") totalCostUsd = (totalCostUsd || 0) + call.costUsd;
       if (!call.content || !call.content.trim()) console.error(`[brain] still-blank model content at step ${step} after all retries, scope=${scope}, messages=${messages.length}`);
       const { text, action } = parseAction(call.content);
 
@@ -822,6 +923,7 @@ app.post("/v1/brain/respond", async (req, res) => {
       messages.push({ role: "user", content: "Give your final answer now, plain text only, no ACTION line." });
       const call = await callModel(messages, `final catch-up, scope=${scope}`);
       totalTokensIn += call.tokensIn || 0; totalTokensOut += call.tokensOut || 0;
+      if (typeof call.costUsd === "number") totalCostUsd = (totalCostUsd || 0) + call.costUsd;
       if (!call.content || !call.content.trim()) console.error(`[brain] still-blank model content at final catch-up after all retries, scope=${scope}, messages=${messages.length}`);
       finalText = parseAction(call.content).text;
     }
@@ -833,7 +935,7 @@ app.post("/v1/brain/respond", async (req, res) => {
 
     await pool.query("INSERT INTO trajectories(scope, session_id, role, content) VALUES ($1,$2,'assistant',$3)",
       [scope, String(conversation_id).slice(0, 200), finalText.slice(0, 20000)]);
-    await logAiCost(scope, String(module).trim() || "unassigned", totalTokensIn, totalTokensOut);
+    await logAiCost(scope, String(module).trim() || "unassigned", totalTokensIn, totalTokensOut, totalCostUsd);
 
     res.json({ response: finalText, action: lastAction, tool_result: lastToolResult, handoff: false });
   } catch (e) {
