@@ -520,7 +520,7 @@ const TOOL_LIBRARY = {
       try {
         const r = await fetch("https://n8n-production-5955.up.railway.app/webhook/booking-guard", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "x-booking-secret": process.env.BOOKING_GUARD_SECRET || "" },
           body: JSON.stringify({ lead_name, lead_phone, appointment_date, appointment_time, lead_email, notes, business_name: scope }),
           signal: AbortSignal.timeout(15000),
         });
