@@ -19,6 +19,7 @@
  */
 const express = require("express");
 const nodePath = require("path");
+const crypto = require("crypto");
 const { Pool } = require("pg");
 
 // connectionTimeoutMillis matters more than it looks: without it, a single
@@ -144,16 +145,80 @@ async function initDb() {
       updated_at TIMESTAMPTZ DEFAULT now()
     );
 
+    -- ── API KEYS: the credential IS the identity ────────────────────────────
+    -- Added 24 Sep 2026. Before this, ONE shared MEMORY_API_KEY authenticated
+    -- every caller and the scope was whatever string the caller put in the
+    -- request body. Anyone holding that key could read any contractor's
+    -- memory by changing one field. That is fine between trusted backends and
+    -- catastrophic the moment a browser or a customer holds a token.
+    --
+    -- Now: a TENANT key is bound to exactly one scope in this table and CANNOT
+    -- name another. Same shape as Switchboard's auth (role on the credential,
+    -- scope read fresh from the database, never from the request).
+    --
+    -- Only the SHA-256 of a key is stored. The raw key is shown once, at
+    -- issue, and is unrecoverable afterwards - a stolen database dump does not
+    -- yield a working key.
+    CREATE TABLE IF NOT EXISTS brain_keys (
+      id BIGSERIAL PRIMARY KEY,
+      key_hash TEXT UNIQUE NOT NULL,     -- sha256 hex of the raw key
+      key_prefix TEXT NOT NULL,          -- first 10 chars, to identify a key without holding it
+      role TEXT NOT NULL,                -- 'TENANT' | 'OWNER' | 'ADMIN'
+      scope TEXT,                        -- REQUIRED for TENANT; NULL for OWNER/ADMIN
+      label TEXT,
+      status TEXT NOT NULL DEFAULT 'ACTIVE',  -- 'ACTIVE' | 'REVOKED'
+      created_at TIMESTAMPTZ DEFAULT now(),
+      last_used_at TIMESTAMPTZ,
+      revoked_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_brain_keys_hash ON brain_keys(key_hash) WHERE status = 'ACTIVE';
+    CREATE INDEX IF NOT EXISTS idx_brain_keys_scope ON brain_keys(scope);
+
+    -- A TENANT key with no scope is a misconfigured credential, not a
+    -- privileged one. The constraint makes that state impossible to create at
+    -- all, rather than relying on every read path to notice.
+    DO $$ BEGIN
+      ALTER TABLE brain_keys ADD CONSTRAINT brain_keys_tenant_needs_scope
+        CHECK (role <> 'TENANT' OR scope IS NOT NULL);
+    EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+    -- Refused cross-scope attempts. An empty table is the expected state; a
+    -- row in it means a key tried to read data it was not issued for.
+    CREATE TABLE IF NOT EXISTS auth_denials (
+      id BIGSERIAL PRIMARY KEY,
+      key_prefix TEXT,
+      key_role TEXT,
+      bound_scope TEXT,
+      attempted_scope TEXT,
+      path TEXT,
+      reason TEXT,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+
   `);
 }
 
-// ── CORS: lets a browser-based admin dashboard call this API directly. This is
-// NOT the security boundary - the Bearer token below is. CORS just decides
-// whether a browser will let a page from another origin make the call at all.
+// ── CORS ─────────────────────────────────────────────────────────────────────
+// Was "*" until 24 Sep 2026. CORS is not the security boundary - the Bearer
+// token is - but "*" on a Bearer-authed API means ANY web page anywhere can
+// make authenticated calls the moment it gets hold of a key, and it advertises
+// that the API is browser-reachable. The admin page is served from this same
+// origin, so it needs no CORS headers at all; only genuinely cross-origin
+// callers do, and those are named explicitly.
+//
+// BRAIN_ALLOWED_ORIGINS: comma-separated exact origins (e.g.
+// "https://cockpit.aiteammate.io"). Unset = no cross-origin browser access,
+// which is the correct default for a server-to-server service.
+const ALLOWED_ORIGINS = String(process.env.BRAIN_ALLOWED_ORIGINS || "")
+  .split(",").map(s => s.trim().replace(/\/+$/, "")).filter(Boolean);
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  const origin = String(req.headers.origin || "").replace(/\/+$/, "");
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  }
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
@@ -168,15 +233,147 @@ app.get(["/admin", "/admin/"], (req, res) => {
 });
 
 // ── Auth + scope guards ──────────────────────────────────────────────────────
-app.use((req, res, next) => {
-  if (req.path === "/health" || req.path === "/monitor/status") return next();
+//
+// THE RULE, and the whole point of this section: a caller's scope comes from
+// its CREDENTIAL, never from its request. The old getScope() read the scope
+// out of the body or query string, so one shared key plus one edited field
+// read any contractor's memory. Ported from Switchboard's middleware/auth.ts,
+// which learned the same lesson: role on the token, identity re-read from the
+// database, deny-by-default on every branch.
+//
+// Roles:
+//   TENANT  one contractor. Scope is bound at issue and cannot be overridden.
+//           Naming a different scope is a refusal, never a silent correction.
+//   OWNER   Joshua's own backends (Harbor). Must name the scope it wants;
+//           cannot touch the admin surface.
+//   ADMIN   Joshua. Cross-scope reads and key management.
+//
+const SCOPE_RE = /^(owner:[a-z0-9_-]{1,40}|tenant:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
+
+// A tenant scope is "tenant:" + the Switchboard Client.id UUID - the SAME
+// tenant id the rest of the stack already uses (Prisma Client.id, and the
+// client_id foreign key on every leads/calls/bookings row). One contractor,
+// one id, everywhere. BRAIN_ALLOW_LOOSE_SCOPES=true relaxes the UUID rule for
+// a staging box; it must never be set in production.
+const LOOSE_SCOPES = process.env.BRAIN_ALLOW_LOOSE_SCOPES === "true";
+const LOOSE_SCOPE_RE = /^[a-zA-Z0-9:_-]{1,120}$/;
+function validScope(s) {
+  return LOOSE_SCOPES ? LOOSE_SCOPE_RE.test(s) : SCOPE_RE.test(s);
+}
+
+const sha256 = (s) => crypto.createHash("sha256").update(s, "utf8").digest("hex");
+
+// Constant-time compare for the legacy key, so a wrong key cannot be found one
+// character at a time by timing the response.
+function safeEqual(a, b) {
+  const A = Buffer.from(String(a), "utf8"), B = Buffer.from(String(b), "utf8");
+  if (A.length !== B.length) return false;
+  return crypto.timingSafeEqual(A, B);
+}
+
+// LEGACY_MEMORY_KEY: the old shared MEMORY_API_KEY, still accepted as an ADMIN
+// credential ONLY while BRAIN_LEGACY_KEY=on, so the cutover does not take
+// Harbor down mid-flight. Every use is logged. Turn it off once fluid-os holds
+// a real OWNER key - that env flag going to "off" is what actually closes the
+// old hole, and this is deliberately opt-IN so forgetting leaves it closed.
+const LEGACY_KEY_ON = process.env.BRAIN_LEGACY_KEY === "on";
+
+const PUBLIC_PATHS = new Set(["/health", "/monitor/status"]);
+// Cross-scope or credential-issuing surface. ADMIN only, always.
+const ADMIN_PATHS = [/^\/admin\//, /^\/keys/, /^\/margin\/summary$/, /^\/integrations\/lookup$/];
+// Expensive or owner-operated. Not reachable by a contractor's own key.
+const NON_TENANT_PATHS = [/^\/reflect$/];
+
+async function logDenial(row) {
+  try {
+    await pool.query(
+      "INSERT INTO auth_denials(key_prefix, key_role, bound_scope, attempted_scope, path, reason) VALUES ($1,$2,$3,$4,$5,$6)",
+      [row.prefix || null, row.role || null, row.bound || null, row.attempted || null, row.path || null, row.reason]);
+  } catch (e) {
+    // Never let the audit write swallow the refusal itself.
+    console.error("[auth] could not record denial:", e.message);
+  }
+}
+
+app.use(async (req, res, next) => {
+  if (PUBLIC_PATHS.has(req.path)) return next();
+
   const tok = (req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
-  if (!API_KEY || tok !== API_KEY) return res.status(401).json({ error: "unauthorized" });
+  if (!tok) return res.status(401).json({ error: "unauthorized" });
+
+  let auth = null;
+  try {
+    const { rows } = await pool.query(
+      "SELECT id, key_prefix, role, scope FROM brain_keys WHERE key_hash=$1 AND status='ACTIVE'", [sha256(tok)]);
+    if (rows[0]) {
+      auth = { id: rows[0].id, prefix: rows[0].key_prefix, role: rows[0].role, scope: rows[0].scope };
+      // Fire-and-forget: last_used_at is for spotting dead keys, not for
+      // correctness, and must never add latency to a real request.
+      pool.query("UPDATE brain_keys SET last_used_at=now() WHERE id=$1", [rows[0].id])
+        .catch(e => console.error("[auth] last_used_at update failed:", e.message));
+    }
+  } catch (e) {
+    // Database down: refuse. An auth check that cannot run has NOT passed.
+    console.error("[auth] key lookup failed:", e.message);
+    return res.status(503).json({ error: "auth unavailable" });
+  }
+
+  if (!auth && LEGACY_KEY_ON && API_KEY && safeEqual(tok, API_KEY)) {
+    console.warn(`[auth] LEGACY shared key used for ${req.method} ${req.path} - issue this caller its own key and set BRAIN_LEGACY_KEY=off`);
+    auth = { id: null, prefix: "legacy", role: "ADMIN", scope: null, legacy: true };
+  }
+
+  if (!auth) {
+    await logDenial({ path: req.path, reason: "unknown_or_revoked_key" });
+    return res.status(401).json({ error: "unauthorized" });
+  }
+
+  // A TENANT key with no bound scope is a broken credential. Refuse it rather
+  // than letting it fall through to the scope resolver, where any widening bug
+  // would hand it the whole database.
+  if (auth.role === "TENANT" && !auth.scope) {
+    await logDenial({ prefix: auth.prefix, role: auth.role, path: req.path, reason: "tenant_key_without_scope" });
+    return res.status(403).json({ error: "credential is not fully set up" });
+  }
+
+  if (ADMIN_PATHS.some(re => re.test(req.path)) && auth.role !== "ADMIN") {
+    await logDenial({ prefix: auth.prefix, role: auth.role, bound: auth.scope, path: req.path, reason: "admin_path_denied" });
+    return res.status(404).json({ error: "not found" }); // 404, not 403 - don't confirm the surface exists
+  }
+  if (NON_TENANT_PATHS.some(re => re.test(req.path)) && auth.role === "TENANT") {
+    await logDenial({ prefix: auth.prefix, role: auth.role, bound: auth.scope, path: req.path, reason: "tenant_path_denied" });
+    return res.status(403).json({ error: "not available for this credential" });
+  }
+
+  // ── Scope resolution. Every branch narrows; none can widen. ──
+  const asked = String(req.body?.scope ?? req.query?.scope ?? "").trim();
+
+  if (auth.role === "TENANT") {
+    // Naming someone else's scope is refused OUT LOUD. Silently substituting
+    // the right one would hide a compromised caller and make the bug invisible
+    // in testing - the failure has to be visible to be fixable.
+    if (asked && asked !== auth.scope) {
+      await logDenial({ prefix: auth.prefix, role: auth.role, bound: auth.scope, attempted: asked, path: req.path, reason: "scope_mismatch" });
+      return res.status(403).json({ error: "scope not permitted for this credential" });
+    }
+    req.scope = auth.scope;
+  } else {
+    if (asked && !validScope(asked)) {
+      return res.status(400).json({ error: "malformed scope" });
+    }
+    req.scope = asked; // may be "" - cross-scope admin routes don't need one
+  }
+
+  req.auth = auth;
   next();
 });
+
+// The only way a route learns its scope. It is already resolved and already
+// authorised by the time any handler runs; this just hands it over. Nothing
+// downstream reads req.body.scope, so no new route can reintroduce the hole
+// by forgetting a filter.
 function getScope(req) {
-  const s = String(req.body?.scope ?? req.query?.scope ?? "").trim();
-  return /^[a-zA-Z0-9:_\-]{1,120}$/.test(s) ? s : "";
+  return req.scope || "";
 }
 
 app.get("/health", async (_req, res) => {
@@ -1044,6 +1241,73 @@ app.post("/integrations/config", async (req, res) => {
      RETURNING field_app_tenant_id, lexi_tenant_id, updated_at`,
     [scope, fieldAppTenantId, lexiTenantId]);
   res.json({ ok: true, config: rows[0] });
+});
+
+// ── KEY MANAGEMENT (ADMIN only) ──────────────────────────────────────────────
+// Issuing a tenant key is what onboarding calls once, when a contractor is
+// provisioned. The raw key comes back EXACTLY ONCE and is never recoverable -
+// store it on the caller's side at that moment or reissue.
+app.post("/keys/issue", async (req, res) => {
+  const role = String(req.body?.role || "").trim().toUpperCase();
+  const label = String(req.body?.label || "").trim().slice(0, 200) || null;
+  let scope = String(req.body?.scope || "").trim() || null;
+
+  if (!["TENANT", "OWNER", "ADMIN"].includes(role)) {
+    return res.status(400).json({ error: "role must be TENANT, OWNER or ADMIN" });
+  }
+  if (role === "TENANT") {
+    if (!scope) return res.status(400).json({ error: "a TENANT key must name the scope it is bound to" });
+    if (!validScope(scope)) {
+      return res.status(400).json({ error: "scope must be tenant:<switchboard client uuid>" });
+    }
+  } else {
+    // OWNER/ADMIN keys are not scope-bound; storing a scope on one would imply
+    // a restriction the code does not actually enforce for those roles.
+    scope = null;
+  }
+
+  // 32 random bytes, base64url. The bk_ prefix makes a leaked key greppable in
+  // logs and recognisable in a commit diff.
+  const raw = "bk_" + crypto.randomBytes(32).toString("base64url");
+  const prefix = raw.slice(0, 10);
+  const { rows } = await pool.query(
+    `INSERT INTO brain_keys (key_hash, key_prefix, role, scope, label)
+     VALUES ($1,$2,$3,$4,$5) RETURNING id, key_prefix, role, scope, label, created_at`,
+    [sha256(raw), prefix, role, scope, label]);
+
+  console.log(`[keys] issued ${role} key ${prefix}... scope=${scope || "(none)"} label=${label || "(none)"}`);
+  res.json({
+    ok: true,
+    key: raw,
+    note: "This is the only time this key is shown. It cannot be recovered - reissue if lost.",
+    record: rows[0],
+  });
+});
+
+// Never returns key material - only enough to tell keys apart and spot dead ones.
+app.get("/keys", async (_req, res) => {
+  const { rows } = await pool.query(
+    `SELECT id, key_prefix, role, scope, label, status, created_at, last_used_at, revoked_at
+     FROM brain_keys ORDER BY status, created_at DESC LIMIT 500`);
+  res.json({ keys: rows });
+});
+
+app.post("/keys/revoke", async (req, res) => {
+  const id = parseInt(req.body?.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: "numeric key id required" });
+  const { rows } = await pool.query(
+    "UPDATE brain_keys SET status='REVOKED', revoked_at=now() WHERE id=$1 AND status='ACTIVE' RETURNING id, key_prefix, role, scope",
+    [id]);
+  if (!rows[0]) return res.status(404).json({ error: "no active key with that id" });
+  console.warn(`[keys] REVOKED ${rows[0].key_prefix}... role=${rows[0].role} scope=${rows[0].scope || "(none)"}`);
+  res.json({ ok: true, revoked: rows[0] });
+});
+
+// Refused cross-scope attempts. Empty is the expected, healthy answer.
+app.get("/admin/denials", async (_req, res) => {
+  const { rows } = await pool.query(
+    "SELECT * FROM auth_denials ORDER BY created_at DESC LIMIT 200");
+  res.json({ denials: rows, count: rows.length });
 });
 
 // Every contractor scope that has ever activated a module - the admin panel's
